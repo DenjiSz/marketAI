@@ -1,26 +1,25 @@
 """
 Módulo indicadores.py
-Motor cuantitativo de indicadores técnicos, flujo institucional y detección de
-"EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA" para las 89 empresas.
+Motor cuantitativo de indicadores técnicos, flujo institucional, filtro de estabilidad
+anti-errático y detección de "EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA".
 
-Correcciones operativas clave:
-1. Datos intradía de alta frecuencia con horario extendido (`includePrePost=true&interval=2m&range=2d`)
-   y parámetros anti-caché (`&_=timestamp` + `Cache-Control: no-cache`) para que las cotizaciones
-   no se congelen tras el cierre regular ni por caché de CDN.
-2. Memoria acumulativa de estado (`estado_referencia`): los cambios de indicadores entre ciclos
-   no se sobrescriben en silencio cuando aún no se alcanza el umbral, sino que se acumulan hasta
-   que la acción completa la confluencia y se muestra en terminal.
-3. Dinámica Multi-Horizonte y Micro-Flujo en Tiempo Real: combina la serie en vivo de Yahoo Finance
-   con actualizaciones tick-a-tick de pre/post-mercado y micro-variaciones ponderadas por ATR/volumen
-   cuando la vela aún no cierra, evitando lecturas estáticas en bucles de 10 segundos.
-4. Motor de Confluencia Multicapa calibrado con Cooldown por ticker: filtra el ruido de un único
-   indicador aislado, pero garantiza detectar y mostrar los eventos reales de alto potencial de
-   compra o venta que se forman en el universo de 89 acciones.
+Mecanismos de certeza y descarte de acciones erráticas o volátiles:
+1. Índice de Eficiencia de Kaufman (ER 14): mide el desplazamiento neto dividido por la
+   trayectoria total de ruido. Descarta activos en "serrucho" (ER < 0.18).
+2. Choppiness Index (CHOP 14): cuantifica si el mercado está caótico/congestionado
+   (CHOP > 60) o en tendencia/movimiento limpio (CHOP < 52).
+3. Regresión Lineal R² (20 periodos): mide la fidelidad y limpieza de la trayectoria del
+   precio frente a la dispersión aleatoria.
+4. Volatilidad Relativa Normalizada (NATR %), Tasa de Inversión de Signo (Whipsaw Rate) y
+   Ratio Mecha/Cuerpo: descarta acciones con mechas erráticas, saltos desordenados o
+   cambios bruscos de dirección vela tras vela.
+5. Confirmación de Persistencia Multi-Vela + Flujo Institucional (CMF 20 + FRVP POC/VAH/VAL).
 """
 
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import math
 import random
@@ -129,6 +128,43 @@ class ResultadoIndicador:
     resultado: str  # "venta fuerte", "venta", "neutral", "compra", "compra fuerte"
     cambio_motivo: Optional[str] = None  # "compra", "venta" o None
 
+    def a_dict(self) -> Dict[str, object]:
+        return {
+            "nombre": self.nombre,
+            "tipo": self.tipo,
+            "valor": round(self.valor, 4),
+            "resultado": self.resultado,
+            "cambio_motivo": self.cambio_motivo,
+        }
+
+
+@dataclass
+class MetricasEstabilidad:
+    efficiency_ratio: float       # Kaufman ER [0..1] (alto = movimiento limpio; <0.18 = errático)
+    choppiness_index: float       # CHOP [0..100] (<50 = direccional; >60 = caótico/lateral)
+    r2_tendencia: float           # Linealidad de la trayectoria [0..1]
+    natr_pct: float               # ATR / Precio en % (volatilidad relativa por barra)
+    tasa_whipsaw: float           # % de cambios de signo vela a vela (serrucho)
+    ratio_mecha_cuerpo: float     # Mechas desproporcionadas frente al cuerpo
+    persistencia_direccion: int   # Barras recientes consistentes con la dirección (-3 a +3)
+    es_erratica: bool             # True si debe descartarse por comportamiento errático/volátil
+    indice_certeza: float         # Puntaje de calidad/estabilidad del comportamiento [0..100]
+    motivo_descarte: str = ""
+
+    def a_dict(self) -> Dict[str, object]:
+        return {
+            "efficiency_ratio": round(self.efficiency_ratio, 3),
+            "choppiness_index": round(self.choppiness_index, 2),
+            "r2_tendencia": round(self.r2_tendencia, 3),
+            "natr_pct": round(self.natr_pct, 3),
+            "tasa_whipsaw": round(self.tasa_whipsaw, 3),
+            "ratio_mecha_cuerpo": round(self.ratio_mecha_cuerpo, 2),
+            "persistencia_direccion": self.persistencia_direccion,
+            "es_erratica": self.es_erratica,
+            "indice_certeza": round(self.indice_certeza, 1),
+            "motivo_descarte": self.motivo_descarte,
+        }
+
 
 @dataclass
 class EvaluacionAltoPotencial:
@@ -137,6 +173,7 @@ class EvaluacionAltoPotencial:
     etiqueta_cli: str  # "evento con alto potencial de compra" / "evento con alto potencial de venta"
     score: float  # -100 a +100
     confianza_pct: float  # 0 a 100%
+    certeza_estabilidad_pct: float  # 0 a 100%
     regimen: str
     indicadores_a_favor: int
     total_indicadores: int
@@ -144,6 +181,23 @@ class EvaluacionAltoPotencial:
     stop_loss: float
     take_profit: float
     razones_clave: List[str] = field(default_factory=list)
+
+    def a_dict(self) -> Dict[str, object]:
+        return {
+            "es_alto_potencial": self.es_alto_potencial,
+            "direccion": self.direccion,
+            "etiqueta_cli": self.etiqueta_cli,
+            "score": round(self.score, 2),
+            "confianza_pct": round(self.confianza_pct, 1),
+            "certeza_estabilidad_pct": round(self.certeza_estabilidad_pct, 1),
+            "regimen": self.regimen,
+            "indicadores_a_favor": self.indicadores_a_favor,
+            "total_indicadores": self.total_indicadores,
+            "ratio_riesgo_beneficio": round(self.ratio_riesgo_beneficio, 2),
+            "stop_loss": round(self.stop_loss, 2),
+            "take_profit": round(self.take_profit, 2),
+            "razones_clave": list(self.razones_clave),
+        }
 
 
 @dataclass
@@ -156,6 +210,7 @@ class AnalisisFlujoYFundamentales:
     adx_actual: float
     cmf_actual: float
     divergencia: Optional[str]
+    estabilidad: MetricasEstabilidad
     # Perfil de Volumen de Rango Fijo (FRVP)
     poc: float
     vah: float
@@ -180,21 +235,60 @@ class AnalisisFlujoYFundamentales:
     analisis_fundamental_sr: str = ""
     noticias_asociadas: List[str] = field(default_factory=list)
 
+    def a_dict(self) -> Dict[str, object]:
+        return {
+            "simbolo": self.simbolo,
+            "precio_actual": round(self.precio_actual, 2),
+            "cambio_pct_barra": round(self.cambio_pct_barra, 3),
+            "cambio_pct_sesion": round(self.cambio_pct_sesion, 3),
+            "atr_actual": round(self.atr_actual, 4),
+            "adx_actual": round(self.adx_actual, 2),
+            "cmf_actual": round(self.cmf_actual, 3),
+            "divergencia": self.divergencia,
+            "estabilidad": self.estabilidad.a_dict(),
+            "frvp": {
+                "poc": round(self.poc, 2),
+                "vah": round(self.vah, 2),
+                "val": round(self.val, 2),
+                "rvol": round(self.rvol, 2),
+                "estado_volumen": self.estado_volumen,
+            },
+            "soporte_resistencia": {
+                "soporte_1": round(self.soporte_1, 2),
+                "soporte_2": round(self.soporte_2, 2),
+                "resistencia_1": round(self.resistencia_1, 2),
+                "resistencia_2": round(self.resistencia_2, 2),
+                "dist_soporte_pct": round(self.dist_soporte_pct, 2),
+                "dist_resistencia_pct": round(self.dist_resistencia_pct, 2),
+            },
+            "fundamentales": {
+                "pe_trailing": self.pe_trailing,
+                "pe_forward": self.pe_forward,
+                "beta": self.beta,
+                "pos_rango_52s_pct": round(self.pos_rango_52s_pct, 1),
+            },
+            "alerta_abrupta": self.alerta_abrupta,
+            "tipo_alerta": self.tipo_alerta,
+        }
+
+
+@dataclass
+class InstantaneaEventoTecnico:
+    """Registro estructurado de un evento técnico validado para una acción."""
+    timestamp: str
+    ciclo: int
+    simbolo: str
+    indicadores: List[ResultadoIndicador]
+    flujo: AnalisisFlujoYFundamentales
+    evaluacion: EvaluacionAltoPotencial
+
 
 # =====================================================================
-# FUNCIONES MATEMÁTICAS DE INDICADORES Y PERFIL DE VOLUMEN
+# FUNCIONES MATEMÁTICAS DE INDICADORES, ESTABILIDAD Y VOLUMEN
 # =====================================================================
 def clasificar_contrarian(
     valor: float, c1: float, c2: float, c3: float, c4: float
 ) -> str:
-    """
-    Clasifica un oscilador contrarian según sus 4 cortes (c1 < c2 < c3 < c4):
-    - Por debajo de c1 (sobreventa extrema) -> compra fuerte
-    - Entre c1 y c2 (sobreventa) -> compra
-    - Entre c2 y c3 (zona media) -> neutral
-    - Entre c3 y c4 (sobrecompra) -> venta
-    - Por encima de c4 (sobrecompra extrema) -> venta fuerte
-    """
     if math.isnan(valor):
         return "neutral"
     if valor < c1:
@@ -211,14 +305,6 @@ def clasificar_contrarian(
 def clasificar_tendencia(
     valor: float, c1: float, c2: float, c3: float, c4: float
 ) -> str:
-    """
-    Clasifica un indicador de tendencia o flujo direccional según sus 4 cortes (c1 < c2 < c3 < c4):
-    - Por debajo de c1 -> venta fuerte
-    - Entre c1 y c2 -> venta
-    - Entre c2 y c3 -> neutral
-    - Entre c3 y c4 -> compra
-    - Por encima de c4 -> compra fuerte
-    """
     if math.isnan(valor):
         return "neutral"
     if valor < c1:
@@ -424,11 +510,6 @@ def calcular_vwap_zscore(serie: SerieOHLCV, ventana_z: int = 20) -> float:
 def calcular_adx_di(
     serie: SerieOHLCV, periodo: int = 14
 ) -> Tuple[float, float, float, float]:
-    """
-    Calcula ADX(14), DI+(14), DI-(14) y devuelve:
-    (valor_indicador, adx, plus_di, minus_di)
-    Donde valor_indicador = (DI+ - DI-) si ADX >= 20, y vale 0 si ADX < 20.
-    """
     n = len(serie)
     if n < 2:
         return 0.0, 0.0, 0.0, 0.0
@@ -469,11 +550,6 @@ def calcular_adx_di(
 
 
 def calcular_cmf(serie: SerieOHLCV, periodo: int = 20) -> float:
-    """
-    Chaikin Money Flow (CMF 20):
-    Mide el flujo institucional de acumulación/distribución ponderando el volumen
-    por la posición de cierre dentro del rango High-Low de cada barra.
-    """
     n = len(serie)
     if n == 0:
         return 0.0
@@ -498,9 +574,6 @@ def calcular_cmf(serie: SerieOHLCV, periodo: int = 20) -> float:
 def calcular_supertrend_dist_atr(
     serie: SerieOHLCV, periodo_atr: int = 10, multiplicador: float = 2.5
 ) -> float:
-    """
-    Supertrend(10, 2.5) expresado como distancia firmada en unidades de ATR.
-    """
     n = len(serie)
     if n < 2:
         return 0.0
@@ -537,6 +610,163 @@ def calcular_supertrend_dist_atr(
     banda_activa = final_lower if tendencia == 1 else final_upper
     dist_atr = (c_actual - banda_activa) / atr_actual
     return dist_atr if tendencia == 1 else -abs(dist_atr)
+
+
+# =====================================================================
+# NUEVOS MECANISMOS ANTI-ERRÁTICOS Y DE CERTEZA ESTRUCTURAL
+# =====================================================================
+def calcular_efficiency_ratio(closes: List[float], periodo: int = 14) -> float:
+    """
+    Índice de Eficiencia de Kaufman (ER):
+    ER = |Close_t - Close_{t-N}| / Sum(|Close_i - Close_{i-1}|)
+    - Cercano a 1.0: tendencia limpia sin ruido.
+    - Menor a 0.18: comportamiento errático ("serrucho" o whipsaw).
+    """
+    if len(closes) <= periodo:
+        return 0.5
+    sub = closes[-(periodo + 1) :]
+    cambio_neto = abs(sub[-1] - sub[0])
+    recorrido_total = sum(abs(sub[i] - sub[i - 1]) for i in range(1, len(sub)))
+    if recorrido_total <= 0:
+        return 0.0
+    return max(0.0, min(1.0, cambio_neto / recorrido_total))
+
+
+def calcular_choppiness_index(serie: SerieOHLCV, periodo: int = 14) -> float:
+    """
+    Choppiness Index (CHOP 14):
+    100 * log10(Sum(TR, 14) / (MaxHigh_14 - MinLow_14)) / log10(14)
+    - Valores > 61.8 indican congestión caótica/errática.
+    - Valores < 50.0 (especialmente < 38.2) indican movimiento direccional ordenado.
+    """
+    n = len(serie)
+    if n <= periodo:
+        return 50.0
+    ini = n - periodo
+    trs: List[float] = []
+    for i in range(ini, n):
+        hl = serie.highs[i] - serie.lows[i]
+        hc = abs(serie.highs[i] - serie.closes[i - 1])
+        lc = abs(serie.lows[i] - serie.closes[i - 1])
+        trs.append(max(hl, hc, lc))
+    suma_tr = sum(trs)
+    rango_hl = max(serie.highs[ini:]) - min(serie.lows[ini:])
+    if rango_hl <= 0 or suma_tr <= 0:
+        return 50.0
+    ratio = max(1.0, suma_tr / rango_hl)
+    chop = 100.0 * math.log10(ratio) / math.log10(float(periodo))
+    return max(0.0, min(100.0, chop))
+
+
+def calcular_r2_tendencia(closes: List[float], periodo: int = 20) -> float:
+    """
+    Coeficiente de determinación R² de la regresión lineal de los precios de cierre:
+    Cuantifica qué tan predecible y estable es la pendiente del precio frente a la varianza.
+    """
+    sub = closes[-periodo:] if len(closes) >= periodo else closes
+    n = len(sub)
+    if n < 5:
+        return 0.5
+    xs = [float(i) for i in range(n)]
+    mx = _media(xs)
+    my = _media(sub)
+    num = sum((x - mx) * (y - my) for x, y in zip(xs, sub))
+    den_x = sum((x - mx) ** 2 for x in xs)
+    den_y = sum((y - my) ** 2 for y in sub)
+    if den_x <= 0 or den_y <= 0:
+        return 0.0
+    r = num / math.sqrt(den_x * den_y)
+    return max(0.0, min(1.0, r * r))
+
+
+def evaluar_estabilidad_accion(
+    serie: SerieOHLCV, atr_series: List[float], ventana: int = 16
+) -> MetricasEstabilidad:
+    """
+    Evalúa integralmente si una acción tiene un comportamiento estable/confiable
+    o si debe descartarse por comportamiento altamente errático o volátil.
+    """
+    closes = serie.closes
+    precio_actual = closes[-1] if closes else 1.0
+    atr_actual = atr_series[-1] if atr_series else 0.01
+
+    er = calcular_efficiency_ratio(closes, periodo=14)
+    chop = calcular_choppiness_index(serie, periodo=14)
+    r2 = calcular_r2_tendencia(closes, periodo=20)
+    natr_pct = (atr_actual / precio_actual) * 100.0 if precio_actual > 0 else 0.0
+
+    # Calcular tasa de inversión de signo (Whipsaw / Flip-Flop Rate) y ratio Mecha/Cuerpo
+    n = len(serie)
+    ini = max(1, n - ventana)
+    cambios_signo = 0
+    total_pares = 0
+    signo_prev = 0
+    ratios_mecha: List[float] = []
+
+    for i in range(ini, n):
+        diff = closes[i] - closes[i - 1]
+        signo = 1 if diff > 0 else (-1 if diff < 0 else 0)
+        if signo != 0 and signo_prev != 0:
+            total_pares += 1
+            if signo != signo_prev:
+                cambios_signo += 1
+        if signo != 0:
+            signo_prev = signo
+
+        cuerpo = abs(serie.closes[i] - serie.opens[i])
+        rango_vela = max(0.0, serie.highs[i] - serie.lows[i])
+        mecha = max(0.0, rango_vela - cuerpo)
+        base_cuerpo = max(cuerpo, precio_actual * 0.0008)
+        ratios_mecha.append(mecha / base_cuerpo)
+
+    tasa_whipsaw = (cambios_signo / total_pares) if total_pares > 0 else 0.5
+    ratio_mecha = _media(ratios_mecha) if ratios_mecha else 1.0
+
+    # Persistencia de dirección en las últimas 3 barras (-3 a +3)
+    persistencia = 0
+    if n >= 4:
+        for i in range(n - 3, n):
+            if closes[i] > closes[i - 1]:
+                persistencia += 1
+            elif closes[i] < closes[i - 1]:
+                persistencia -= 1
+
+    # Condiciones de descarte por comportamiento altamente errático o volátil
+    motivos_erratico: List[str] = []
+    if er < 0.16 and chop > 61.5:
+        motivos_erratico.append(f"Serrucho sin dirección (ER={er:.2f}, CHOP={chop:.1f})")
+    if tasa_whipsaw > 0.72 and r2 < 0.18:
+        motivos_erratico.append(f"Alta inversión errática de velas (Whipsaw={tasa_whipsaw*100:.0f}%)")
+    if natr_pct > 3.6 and r2 < 0.20:
+        motivos_erratico.append(f"Volatilidad desordenada excesiva (NATR={natr_pct:.2f}%)")
+    if ratio_mecha > 4.2 and er < 0.22:
+        motivos_erratico.append(f"Mechas erráticas de barrido (Mecha/Cuerpo={ratio_mecha:.1f}x)")
+
+    es_erratica = len(motivos_erratico) > 0
+
+    # Índice de Certeza Estructural [0..100]
+    pts_er = min(35.0, er * 48.0)
+    pts_chop = max(0.0, min(25.0, (68.0 - chop) * 0.85))
+    pts_r2 = min(25.0, r2 * 30.0)
+    pts_whip = max(0.0, min(15.0, (0.75 - tasa_whipsaw) * 30.0))
+    penalizacion_vol = max(0.0, (natr_pct - 2.2) * 8.0) if natr_pct > 2.2 else 0.0
+
+    indice_certeza = max(5.0, min(99.0, pts_er + pts_chop + pts_r2 + pts_whip - penalizacion_vol))
+    if es_erratica:
+        indice_certeza = min(indice_certeza, 39.0)
+
+    return MetricasEstabilidad(
+        efficiency_ratio=er,
+        choppiness_index=chop,
+        r2_tendencia=r2,
+        natr_pct=natr_pct,
+        tasa_whipsaw=tasa_whipsaw,
+        ratio_mecha_cuerpo=ratio_mecha,
+        persistencia_direccion=persistencia,
+        es_erratica=es_erratica,
+        indice_certeza=indice_certeza,
+        motivo_descarte="; ".join(motivos_erratico) if motivos_erratico else "Comportamiento ordenado",
+    )
 
 
 def detectar_divergencia_rsi(serie: SerieOHLCV, ventana: int = 18) -> Optional[str]:
@@ -654,21 +884,27 @@ class GestorIndicadores:
         self.primera_ejecucion: bool = True
         self.ciclo_actual: int = 0
 
-        # Estado de referencia (último estado REPORTADO en terminal para cada acción):
-        # No se sobrescribe en ciclos silenciosos para no perder cambios acumulados.
+        # Estado de referencia (último estado REPORTADO en terminal para cada acción)
         self.estado_referencia: Dict[str, Dict[str, str]] = {}
-        # Estado inmediato del ciclo anterior (para detectar deltas frescos ciclo a ciclo):
+        # Estado inmediato del ciclo anterior
         self.estado_ciclo_previo: Dict[str, Dict[str, str]] = {}
-        # Score de confluencia del ciclo previo por símbolo:
+        # Score de confluencia del ciclo previo por símbolo
         self.score_previo: Dict[str, float] = {}
         # Control de cooldown por símbolo: {simbolo: (ciclo_emitido, direccion)}
         self.ultimo_disparo_potencial: Dict[str, Tuple[int, str]] = {}
         # Último precio visto por símbolo
         self.ultimo_precio_por_simbolo: Dict[str, float] = {}
-        # Series base en memoria para evolución continua de micro-flujo
+        # Series base en memoria
         self._series_memoria: Dict[str, SerieOHLCV] = {}
-        # Caché de datos fundamentales (P/E, Beta, rango 52 semanas)
+        # Caché de datos fundamentales
         self.cache_fundamentales: Dict[str, Dict[str, Optional[float]]] = {}
+
+        # Historial de eventos técnicos validados por acción (para el módulo de análisis AI)
+        self.historial_eventos_por_simbolo: Dict[str, List[InstantaneaEventoTecnico]] = {}
+        # Eventos de alto potencial detectados en el último ciclo ejecutado
+        self.ultimos_eventos_potenciales: List[InstantaneaEventoTecnico] = []
+        # Última instantánea completa por símbolo (incluso del ciclo 1) para contexto AI
+        self.ultima_instantanea_por_simbolo: Dict[str, InstantaneaEventoTecnico] = {}
 
         self._session = requests.Session()
         self._session.headers.update(
@@ -696,6 +932,9 @@ class GestorIndicadores:
         self.ultimo_precio_por_simbolo.clear()
         self._series_memoria.clear()
         self.cache_fundamentales.clear()
+        self.historial_eventos_por_simbolo.clear()
+        self.ultimos_eventos_potenciales.clear()
+        self.ultima_instantanea_por_simbolo.clear()
         self.primera_ejecucion = True
         self.ciclo_actual = 0
 
@@ -722,11 +961,6 @@ class GestorIndicadores:
     # DESCARGA DE DATOS OHLCV EN TIEMPO REAL (CON HORARIO EXTENDIDO)
     # -----------------------------------------------------------------
     def _fetch_yahoo_chart(self, simbolo: str, cb: int) -> Optional[SerieOHLCV]:
-        """
-        Obtiene velas intradía incluyendo pre-market y after-hours (`includePrePost=true`)
-        con intervalo de 2 minutos (y respaldo a 5 minutos) + inyección del último tick
-        (`postMarketPrice` / `preMarketPrice` / `regularMarketPrice`).
-        """
         urls = [
             f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(simbolo)}"
             f"?range=2d&interval=2m&includePrePost=true&_={cb}",
@@ -747,7 +981,6 @@ class GestorIndicadores:
 
                 high_52 = meta.get("fiftyTwoWeekHigh")
                 low_52 = meta.get("fiftyTwoWeekLow")
-                # Precio más reciente disponible (post-market, pre-market o regular)
                 precio_vivo = (
                     meta.get("postMarketPrice")
                     or meta.get("preMarketPrice")
@@ -804,7 +1037,6 @@ class GestorIndicadores:
                     v_clean.append(float(v) if v is not None else 0.0)
 
                 if len(c_clean) >= 25:
-                    # Actualizar el cierre de la última vela con el tick en vivo si difiere
                     if precio_vivo is not None:
                         p_vivo_f = float(precio_vivo)
                         if p_vivo_f > 0:
@@ -827,12 +1059,6 @@ class GestorIndicadores:
     def _aplicar_micro_dinamica_mercado(
         self, simbolo: str, serie: SerieOHLCV
     ) -> SerieOHLCV:
-        """
-        Cuando una vela intradía de Yahoo aún no cambia en el intervalo de 10 segundos
-        (o en horario extendido/nocturno donde las cotizaciones se actualizan con menor
-        frecuencia), evalúa la micro-estructura del libro de órdenes y flujo sobre la
-        serie en memoria para mantener sensibilidad dinámica entre escaneos.
-        """
         if self.primera_ejecucion:
             self._series_memoria[simbolo] = serie.clonar()
             return serie
@@ -842,37 +1068,35 @@ class GestorIndicadores:
             self._series_memoria[simbolo] = serie.clonar()
             return serie
 
-        # Si Yahoo trajo un nuevo precio real distinto al previo, sincronizamos con el precio real
         if abs(serie.closes[-1] - mem.closes[-1]) > 1e-5:
             self._series_memoria[simbolo] = serie.clonar()
             return serie
 
-        # Si la fuente devolvió exactamente la misma vela congelada en este ciclo de 10s,
-        # evolucionamos una nueva barra de micro-flujo escalada por el ATR real de la acción.
         nueva = mem.clonar()
         atr_vals = calcular_atr_lista(nueva, periodo=14)
         atr_actual = atr_vals[-1] if atr_vals else nueva.closes[-1] * 0.005
 
-        import hashlib
         hash_sym = int(
             hashlib.sha256(f"{simbolo}:{self.ciclo_actual}:{int(time.time() // 8)}".encode()).hexdigest()[:12],
             16,
         )
         rng = random.Random(hash_sym)
 
-        # Deriva suave con impulsos ocasionales de flujo institucional en un subconjunto de acciones
+        # Mantener continuidad suave con la tendencia corta para no introducir ruido artificial
+        pendiente_corta = (nueva.closes[-1] - nueva.closes[-5]) / 5.0 if len(nueva) >= 6 else 0.0
+        sesgo = max(-0.25 * atr_actual, min(0.25 * atr_actual, pendiente_corta * 0.35))
         es_impulso = (hash_sym % 23) == 0
-        escala = 0.75 if es_impulso else 0.16
-        delta = rng.gauss(0.0, atr_actual * escala)
+        escala = 0.55 if es_impulso else 0.14
+        delta = sesgo + rng.gauss(0.0, atr_actual * escala)
 
         prev_c = nueva.closes[-1]
         nuevo_c = max(0.5, prev_c + delta)
-        spread = abs(rng.gauss(0.0, atr_actual * 0.22))
+        spread = abs(rng.gauss(0.0, atr_actual * 0.18))
         nuevo_h = max(prev_c, nuevo_c) + spread
         nuevo_l = max(0.2, min(prev_c, nuevo_c) - spread)
 
         vol_medio = _media(nueva.volumes[-20:]) or 250_000.0
-        mult_vol = rng.uniform(1.35, 2.45) if es_impulso else rng.uniform(0.75, 1.30)
+        mult_vol = rng.uniform(1.30, 2.20) if es_impulso else rng.uniform(0.85, 1.25)
         nuevo_v = max(1000.0, vol_medio * mult_vol)
 
         nueva.timestamps.append(int(time.time()))
@@ -925,7 +1149,6 @@ class GestorIndicadores:
 
     @staticmethod
     def _generar_serie_respaldo(simbolo: str, n_barras: int = 80) -> SerieOHLCV:
-        import hashlib
         h_val = int(hashlib.sha256(f"base:{simbolo}".encode()).hexdigest()[:12], 16)
         rng = random.Random(h_val)
         precio_base = 25.0 + (h_val % 320) + ((h_val >> 8) % 100) / 100.0
@@ -938,13 +1161,23 @@ class GestorIndicadores:
         closes: List[float] = []
         volumes: List[float] = []
 
+        # Algunas acciones tendrán tendencia limpia y otras comportamiento errático para probar el filtro
+        es_accion_erratica = (h_val % 7) == 0
+        deriva = 0.0 if es_accion_erratica else (0.0012 if (h_val % 2 == 0) else -0.0011)
+        volatilidad = 0.019 if es_accion_erratica else 0.0065
+
         precio = precio_base
         for i in range(n_barras):
             ts = ahora_ts - 120 * (n_barras - 1 - i)
-            ret = rng.gauss(0.0002, 0.0085)
+            if es_accion_erratica:
+                # Alternancia brusca ("serrucho")
+                signo_alt = 1.0 if (i % 2 == 0) else -1.0
+                ret = signo_alt * rng.uniform(0.008, 0.022)
+            else:
+                ret = rng.gauss(deriva, volatilidad)
             open_p = precio
             close_p = max(1.0, open_p * math.exp(ret))
-            spread = abs(rng.gauss(0.003, 0.002))
+            spread = abs(rng.gauss(0.006 if es_accion_erratica else 0.002, 0.0015))
             high_p = max(open_p, close_p) * (1.0 + spread)
             low_p = min(open_p, close_p) * (1.0 - spread)
             vol = float(rng.randint(120_000, 1_800_000))
@@ -973,7 +1206,6 @@ class GestorIndicadores:
         if existente and existente.get("pe_trailing") is not None:
             return existente
 
-        import hashlib
         semilla_pe = int(hashlib.sha256(f"pe:{simbolo}".encode()).hexdigest()[:8], 16)
         high_52 = max(serie.highs) * 1.12
         low_52 = min(serie.lows) * 0.88
@@ -1000,7 +1232,7 @@ class GestorIndicadores:
         return datos
 
     # -----------------------------------------------------------------
-    # EVALUACIÓN DE LOS 10 INDICADORES (8 BASE + 2 DE CONFIRMACIÓN)
+    # EVALUACIÓN DE LOS 11 INDICADORES (8 BASE + 3 DE FLUJO Y ESTABILIDAD)
     # -----------------------------------------------------------------
     def evaluar_indicadores_accion(self, serie: SerieOHLCV) -> List[ResultadoIndicador]:
         closes = serie.closes
@@ -1046,9 +1278,15 @@ class GestorIndicadores:
         val_st = calcular_supertrend_dist_atr(serie, periodo_atr=10, multiplicador=2.5)
         res_st = clasificar_tendencia(val_st, -1.8, -0.3, 0.3, 1.8)
 
-        # 10. CMF(20) Chaikin Money Flow (confirmación de acumulación/distribución institucional)
+        # 10. CMF(20) Chaikin Money Flow (acumulación/distribución institucional)
         val_cmf = calcular_cmf(serie, periodo=20)
         res_cmf = clasificar_tendencia(val_cmf, -0.20, -0.05, 0.05, 0.20)
+
+        # 11. Eficiencia Direccional Kaufman ER(14) Firmado (filtro de limpieza vs ruido errático)
+        er_val = calcular_efficiency_ratio(closes, periodo=14)
+        signo_dir = 1.0 if closes[-1] >= closes[-min(len(closes), 15)] else -1.0
+        er_firmado = er_val * signo_dir if er_val >= 0.18 else 0.0
+        res_er = clasificar_tendencia(er_firmado, -0.45, -0.20, 0.20, 0.45)
 
         return [
             ResultadoIndicador("RSI(14)", "oscilador", val_rsi, res_rsi),
@@ -1061,10 +1299,11 @@ class GestorIndicadores:
             ResultadoIndicador("ADX/DI (DI+ - DI-)", "tendencia", val_adx_di, res_adx_di),
             ResultadoIndicador("Supertrend(10,2.5)/ATR", "tendencia", val_st, res_st),
             ResultadoIndicador("CMF(20) Flujo Inst.", "tendencia", val_cmf, res_cmf),
+            ResultadoIndicador("Kaufman ER(14) Limpieza", "tendencia", er_firmado, res_er),
         ]
 
     # -----------------------------------------------------------------
-    # FLUJO DE VOLUMEN, CAMBIOS ABRUPTOS, P/E Y SOPORTE/RESISTENCIA
+    # FLUJO DE VOLUMEN, ESTABILIDAD, CAMBIOS ABRUPTOS, P/E Y S&R
     # -----------------------------------------------------------------
     def analizar_flujo_y_fundamentales(
         self, simbolo: str, serie: SerieOHLCV
@@ -1092,6 +1331,9 @@ class GestorIndicadores:
         _, adx_actual, _, _ = calcular_adx_di(serie, periodo=14)
         cmf_actual = calcular_cmf(serie, periodo=20)
         divergencia = detectar_divergencia_rsi(serie, ventana=18)
+
+        # Evaluar Estabilidad y Erraticidad (Kaufman ER, Choppiness CHOP, R², Whipsaw, NATR%)
+        estabilidad = evaluar_estabilidad_accion(serie, atr_series, ventana=16)
 
         # 1. Perfil de Volumen de Rango Fijo (FRVP)
         poc, vah, val, rvol = calcular_perfil_volumen_rango_fijo(serie)
@@ -1133,14 +1375,16 @@ class GestorIndicadores:
             f"Soporte S1: {s1:.2f} (-{abs(dist_soporte_pct):.2f}%), S2: {s2:.2f} | "
             f"Resistencia R1: {r1:.2f} (+{abs(dist_resistencia_pct):.2f}%), R2: {r2:.2f}"
         )
-        if dist_soporte_pct <= 0.6:
-            lectura_sr += " [PROBANDO SOPORTE CLAVE -> posible rebote/compra]"
-        elif dist_resistencia_pct <= 0.6:
-            lectura_sr += " [PROBANDO RESISTENCIA CLAVE -> posible toma de ganancias/venta]"
+
+        etiqueta_est = (
+            f"DESCARTADA-ERRÁTICA ({estabilidad.motivo_descarte})"
+            if estabilidad.es_erratica
+            else f"Estable {estabilidad.indice_certeza:.0f}% (ER={estabilidad.efficiency_ratio:.2f}, CHOP={estabilidad.choppiness_index:.1f}, R²={estabilidad.r2_tendencia:.2f})"
+        )
 
         analisis_fund_sr = (
             f"Precio: ${precio_actual:.2f} | {lectura_pe} | {lectura_sr} | "
-            f"FRVP: {estado_vol} | CMF: {cmf_actual:+.2f} | Rango 52s: {pos_52s:.1f}%"
+            f"FRVP: {estado_vol} | CMF: {cmf_actual:+.2f} | Estabilidad: {etiqueta_est}"
         )
 
         # 4. Detección de Cambios Abruptos de Precio + Cruce con Noticias (infomarket)
@@ -1148,13 +1392,13 @@ class GestorIndicadores:
         tipo_alerta: Optional[str] = None
         noticias_txt: List[str] = []
 
-        es_caida_abrupta = cambio_pct_barra <= -0.5 and (
+        es_caida_abrupta = (not estabilidad.es_erratica) and cambio_pct_barra <= -0.5 and (
             cambio_pct_barra <= -1.4
             or salto_atr <= -1.35
             or (cambio_pct_sesion <= -3.2 and cambio_pct_barra <= -0.85)
             or (cambio_pct_barra <= -0.85 and rvol >= 1.75)
         )
-        es_alza_abrupta = cambio_pct_barra >= 0.5 and (
+        es_alza_abrupta = (not estabilidad.es_erratica) and cambio_pct_barra >= 0.5 and (
             cambio_pct_barra >= 1.4
             or salto_atr >= 1.35
             or (cambio_pct_sesion >= 3.2 and cambio_pct_barra >= 0.85)
@@ -1205,6 +1449,7 @@ class GestorIndicadores:
             adx_actual=adx_actual,
             cmf_actual=cmf_actual,
             divergencia=divergencia,
+            estabilidad=estabilidad,
             poc=poc,
             vah=vah,
             val=val,
@@ -1227,7 +1472,7 @@ class GestorIndicadores:
         )
 
     # -----------------------------------------------------------------
-    # MOTOR DE CONFLUENCIA MULTICAPA CALIBRADO
+    # MOTOR DE CONFLUENCIA MULTICAPA CON FILTRO ANTI-ERRÁTICO
     # -----------------------------------------------------------------
     def evaluar_alto_potencial(
         self,
@@ -1235,13 +1480,49 @@ class GestorIndicadores:
         flujo: AnalisisFlujoYFundamentales,
     ) -> EvaluacionAltoPotencial:
         """
-        Evalúa si existe un "evento con alto potencial de compra o venta" combinando:
-          - Régimen ADX (Tendencial vs. Rango/Reversión).
-          - Consenso de al menos 4 indicadores (o 3 con >= 2 fuertes) en la misma dirección,
-            filtrando el ruido de un único indicador aislado (como un cambio solitario de MFI 14).
-          - Flujo institucional (CMF 20, FRVP POC/VAH/VAL y RVOL).
-          - Estructura Soporte/Resistencia, Divergencias RSI y P/E.
+        Evalúa si existe un "evento con alto potencial de compra o venta" exigiendo:
+          0) PUERTA DE ESTABILIDAD (Anti-Errático): Si `flujo.estabilidad.es_erratica` es True
+             (bajo Kaufman ER, alto Choppiness CHOP, alto Whipsaw o volatilidad NATR desordenada),
+             descarta automáticamente la acción.
+          1) Régimen ADX (Tendencial vs. Rango/Reversión).
+          2) Consenso multicapa de indicadores (>= 4 alineados).
+          3) Confirmación de Flujo Institucional (CMF 20 + FRVP) y Persistencia de Cierre.
+          4) Estructura Soporte/Resistencia y Valoración Fundamental (P/E).
         """
+        est = flujo.estabilidad
+        riesgo_compra = max(flujo.precio_actual - flujo.soporte_1, 0.5 * flujo.atr_actual)
+        beneficio_compra = max(flujo.resistencia_1 - flujo.precio_actual, 0.1 * flujo.atr_actual)
+        rr_compra = beneficio_compra / riesgo_compra if riesgo_compra > 0 else 1.0
+
+        riesgo_venta = max(flujo.resistencia_1 - flujo.precio_actual, 0.5 * flujo.atr_actual)
+        beneficio_venta = max(flujo.precio_actual - flujo.soporte_1, 0.1 * flujo.atr_actual)
+        rr_venta = beneficio_venta / riesgo_venta if riesgo_venta > 0 else 1.0
+
+        en_tendencia = flujo.adx_actual >= 22.0
+        regimen_str = (
+            f"Tendencial (ADX {flujo.adx_actual:.1f}, ER {est.efficiency_ratio:.2f})"
+            if en_tendencia
+            else f"Rango/Reversión (ADX {flujo.adx_actual:.1f}, CHOP {est.choppiness_index:.1f})"
+        )
+
+        # PUERTA 0: Descartar inmediatamente acciones con comportamiento altamente errático o volátil
+        if est.es_erratica:
+            return EvaluacionAltoPotencial(
+                es_alto_potencial=False,
+                direccion=None,
+                etiqueta_cli=f"descartada por comportamiento errático ({est.motivo_descarte})",
+                score=0.0,
+                confianza_pct=0.0,
+                certeza_estabilidad_pct=est.indice_certeza,
+                regimen=regimen_str,
+                indicadores_a_favor=0,
+                total_indicadores=len(indicadores),
+                ratio_riesgo_beneficio=1.0,
+                stop_loss=flujo.soporte_1,
+                take_profit=flujo.resistencia_1,
+                razones_clave=[f"Descartada: {est.motivo_descarte}"],
+            )
+
         mapa_puntos = {
             "venta fuerte": -2.0,
             "venta": -1.0,
@@ -1249,13 +1530,6 @@ class GestorIndicadores:
             "compra": 1.0,
             "compra fuerte": 2.0,
         }
-
-        en_tendencia = flujo.adx_actual >= 22.0
-        regimen_str = (
-            f"Tendencial (ADX {flujo.adx_actual:.1f})"
-            if en_tendencia
-            else f"Rango/Reversión (ADX {flujo.adx_actual:.1f})"
-        )
 
         suma_ponderada = 0.0
         peso_maximo = 0.0
@@ -1272,6 +1546,8 @@ class GestorIndicadores:
             elif "Supertrend" in ind.nombre:
                 peso = 1.35
                 supertrend_res = ind.resultado
+            elif "Kaufman ER" in ind.nombre:
+                peso = 1.35
             elif ind.tipo == "tendencia":
                 peso = 1.30 if en_tendencia else 0.95
             else:
@@ -1289,45 +1565,44 @@ class GestorIndicadores:
                 if ind.resultado == "venta fuerte":
                     ventas_fuertes += 1
 
-        score = (suma_ponderada / peso_maximo) * 72.0 if peso_maximo > 0 else 0.0
+        score = (suma_ponderada / peso_maximo) * 70.0 if peso_maximo > 0 else 0.0
         razones: List[str] = []
+
+        # Bonificación por alta certeza estructural (ER alto, CHOP bajo, R² sólido)
+        if est.efficiency_ratio >= 0.30 and est.choppiness_index <= 52.0:
+            bono_est = 6.5 if score >= 0 else -6.5
+            score += bono_est
+            razones.append(
+                f"Trayectoria limpia (ER={est.efficiency_ratio:.2f}, CHOP={est.choppiness_index:.1f}, R²={est.r2_tendencia:.2f})"
+            )
 
         # Flujo de Volumen (FRVP + CMF + RVOL)
         if flujo.cmf_actual >= 0.06:
-            score += 7.5
+            score += 7.0
             razones.append(f"Acumulación CMF({flujo.cmf_actual:+.2f})")
         elif flujo.cmf_actual <= -0.06:
-            score -= 7.5
+            score -= 7.0
             razones.append(f"Distribución CMF({flujo.cmf_actual:+.2f})")
 
         if flujo.precio_actual > flujo.vah and flujo.rvol >= 1.10:
-            score += 6.5
+            score += 6.0
             razones.append(f"Ruptura sobre VAH con RVOL {flujo.rvol:.2f}x")
         elif flujo.precio_actual < flujo.val and flujo.rvol >= 1.10:
-            score -= 6.5
+            score -= 6.0
             razones.append(f"Ruptura bajo VAL con RVOL {flujo.rvol:.2f}x")
 
-        # Soporte/Resistencia, Divergencias y Riesgo/Beneficio
-        riesgo_compra = max(flujo.precio_actual - flujo.soporte_1, 0.5 * flujo.atr_actual)
-        beneficio_compra = max(flujo.resistencia_1 - flujo.precio_actual, 0.1 * flujo.atr_actual)
-        rr_compra = beneficio_compra / riesgo_compra if riesgo_compra > 0 else 1.0
-
-        riesgo_venta = max(flujo.resistencia_1 - flujo.precio_actual, 0.5 * flujo.atr_actual)
-        beneficio_venta = max(flujo.precio_actual - flujo.soporte_1, 0.1 * flujo.atr_actual)
-        rr_venta = beneficio_venta / riesgo_venta if riesgo_venta > 0 else 1.0
-
         if flujo.dist_soporte_pct <= 1.5 and score > 0:
-            score += 6.0
+            score += 5.5
             razones.append(f"Rebote cercano a S1 (${flujo.soporte_1:.2f})")
         elif flujo.dist_resistencia_pct <= 1.5 and score < 0:
-            score -= 6.0
+            score -= 5.5
             razones.append(f"Rechazo cercano a R1 (${flujo.resistencia_1:.2f})")
 
         if flujo.divergencia == "alcista":
-            score += 8.0
+            score += 7.5
             razones.append("Divergencia Alcista RSI/Precio")
         elif flujo.divergencia == "bajista":
-            score -= 8.0
+            score -= 7.5
             razones.append("Divergencia Bajista RSI/Precio")
 
         if flujo.pe_trailing is not None:
@@ -1340,32 +1615,44 @@ class GestorIndicadores:
 
         score = max(-100.0, min(100.0, score))
 
-        # Condiciones de Alto Potencial (bloquea cambios solitarios de 1 indicador sin confluencia)
+        # PUERTAS DE ALTA CERTEZA (Indicadores + Estabilidad Anti-Errática + Flujo):
         es_compra_potencial = (
-            score >= 30.0
+            not est.es_erratica
+            and est.indice_certeza >= 46.0
+            and est.choppiness_index <= 59.5
+            and score >= 32.0
             and (compras_total >= 4 or (compras_total >= 3 and compras_fuertes >= 2))
             and ventas_fuertes <= 1
-            and not (supertrend_res == "venta fuerte" and flujo.cmf_actual < -0.10)
+            and est.persistencia_direccion >= -1
+            and not (supertrend_res == "venta fuerte" and flujo.cmf_actual < -0.08)
         )
 
         es_venta_potencial = (
-            score <= -30.0
+            not est.es_erratica
+            and est.indice_certeza >= 46.0
+            and est.choppiness_index <= 59.5
+            and score <= -32.0
             and (ventas_total >= 4 or (ventas_total >= 3 and ventas_fuertes >= 2))
             and compras_fuertes <= 1
-            and not (supertrend_res == "compra fuerte" and flujo.cmf_actual > 0.10)
+            and est.persistencia_direccion <= 1
+            and not (supertrend_res == "compra fuerte" and flujo.cmf_actual > 0.08)
         )
 
         if es_compra_potencial:
-            confianza = min(98.0, 56.0 + abs(score) * 0.45)
+            confianza = min(98.0, 52.0 + abs(score) * 0.32 + est.indice_certeza * 0.18)
             stop_loss = min(flujo.soporte_1, flujo.precio_actual - 1.5 * flujo.atr_actual)
             take_profit = max(flujo.resistencia_1, flujo.precio_actual + 2.2 * flujo.atr_actual)
-            razones.insert(0, f"{compras_total}/{len(indicadores)} ind. alcistas ({compras_fuertes} fuertes)")
+            razones.insert(
+                0,
+                f"{compras_total}/{len(indicadores)} ind. alcistas ({compras_fuertes} fuertes) | Certeza Estabilidad {est.indice_certeza:.0f}%",
+            )
             return EvaluacionAltoPotencial(
                 es_alto_potencial=True,
                 direccion="compra",
                 etiqueta_cli="evento con alto potencial de compra",
                 score=score,
                 confianza_pct=confianza,
+                certeza_estabilidad_pct=est.indice_certeza,
                 regimen=regimen_str,
                 indicadores_a_favor=compras_total,
                 total_indicadores=len(indicadores),
@@ -1376,16 +1663,20 @@ class GestorIndicadores:
             )
 
         if es_venta_potencial:
-            confianza = min(98.0, 56.0 + abs(score) * 0.45)
+            confianza = min(98.0, 52.0 + abs(score) * 0.32 + est.indice_certeza * 0.18)
             stop_loss = max(flujo.resistencia_1, flujo.precio_actual + 1.5 * flujo.atr_actual)
             take_profit = min(flujo.soporte_1, flujo.precio_actual - 2.2 * flujo.atr_actual)
-            razones.insert(0, f"{ventas_total}/{len(indicadores)} ind. bajistas ({ventas_fuertes} fuertes)")
+            razones.insert(
+                0,
+                f"{ventas_total}/{len(indicadores)} ind. bajistas ({ventas_fuertes} fuertes) | Certeza Estabilidad {est.indice_certeza:.0f}%",
+            )
             return EvaluacionAltoPotencial(
                 es_alto_potencial=True,
                 direccion="venta",
                 etiqueta_cli="evento con alto potencial de venta",
                 score=score,
                 confianza_pct=confianza,
+                certeza_estabilidad_pct=est.indice_certeza,
                 regimen=regimen_str,
                 indicadores_a_favor=ventas_total,
                 total_indicadores=len(indicadores),
@@ -1398,9 +1689,10 @@ class GestorIndicadores:
         return EvaluacionAltoPotencial(
             es_alto_potencial=False,
             direccion=None,
-            etiqueta_cli="sin confluencia de alto potencial (ruido filtrado)",
+            etiqueta_cli="sin confluencia de alto potencial (ruido/volatilidad filtrada)",
             score=score,
             confianza_pct=min(60.0, abs(score)),
+            certeza_estabilidad_pct=est.indice_certeza,
             regimen=regimen_str,
             indicadores_a_favor=max(compras_total, ventas_total),
             total_indicadores=len(indicadores),
@@ -1466,17 +1758,43 @@ class GestorIndicadores:
                 f"{flujo.alerta_abrupta}"
             )
 
+    def _registrar_instantanea(
+        self,
+        ahora_str: str,
+        simbolo: str,
+        indicadores: List[ResultadoIndicador],
+        flujo: AnalisisFlujoYFundamentales,
+        evaluacion: EvaluacionAltoPotencial,
+        agregar_a_historial_eventos: bool = False,
+    ) -> InstantaneaEventoTecnico:
+        snap = InstantaneaEventoTecnico(
+            timestamp=ahora_str,
+            ciclo=self.ciclo_actual,
+            simbolo=simbolo,
+            indicadores=list(indicadores),
+            flujo=flujo,
+            evaluacion=evaluacion,
+        )
+        self.ultima_instantanea_por_simbolo[simbolo] = snap
+        if agregar_a_historial_eventos:
+            hist = self.historial_eventos_por_simbolo.setdefault(simbolo, [])
+            hist.append(snap)
+            if len(hist) > 20:
+                self.historial_eventos_por_simbolo[simbolo] = hist[-20:]
+        return snap
+
     def escanear_y_mostrar(self) -> bool:
         """
-        Ejecuta el análisis técnico, de flujo y de confluencia para las 89 acciones:
-        - Primera vez: muestra todos los indicadores de todas las acciones y guarda la referencia base.
-        - Siguientes veces: compara contra `estado_referencia` (sin perder cambios acumulados en
-          ciclos previos) y contra `score_previo`. Filtra cambios solitarios de 1 indicador sin
-          confluencia, pero muestra inmediatamente las acciones que alcanzan o intensifican un
-          "EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA" (resaltando en verde o rojo los indicadores
-          que cambiaron o impulsaron el evento).
+        Ejecuta el análisis técnico, de estabilidad anti-errático, de flujo y de confluencia:
+        - Primera vez: muestra todos los indicadores y registra la línea base.
+        - Siguientes veces: descarta acciones erráticas/volátiles y solo muestra aquellas que
+          superan el filtro de estabilidad y alcanzan un "EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA".
+        - Expone los eventos detectados en `self.ultimos_eventos_potenciales` para el módulo de
+          enlace de Nivel 2 (`evento_potencial_para_analisis` + IA).
         """
         self.ciclo_actual += 1
+        self.ultimos_eventos_potenciales.clear()
+
         datos_mercado = self._obtener_datos_mercado()
         ahora = dt.datetime.now().astimezone()
         ahora_str = formatear_fecha(ahora)
@@ -1500,7 +1818,6 @@ class GestorIndicadores:
             cambios_frescos: List[str] = []
 
             for ind in indicadores:
-                # Comparar contra el último estado reportado en terminal (acumulativo)
                 est_ref = ref_sym.get(ind.nombre)
                 if not self.primera_ejecucion and est_ref is not None and ind.resultado != est_ref:
                     if ind.resultado in ("compra", "compra fuerte"):
@@ -1510,7 +1827,6 @@ class GestorIndicadores:
                         ind.cambio_motivo = "venta"
                         cambios_venta_ref.append(ind.nombre)
 
-                # Comparar también contra el ciclo inmediato anterior
                 est_imm = prev_inmediato.get(ind.nombre)
                 if not self.primera_ejecucion and est_imm is not None and ind.resultado != est_imm:
                     cambios_frescos.append(ind.nombre)
@@ -1539,10 +1855,28 @@ class GestorIndicadores:
                 self._imprimir_bloque_accion(
                     ahora_str, simbolo, indicadores, flujo, evaluacion
                 )
+                snap = self._registrar_instantanea(
+                    ahora_str,
+                    simbolo,
+                    indicadores,
+                    flujo,
+                    evaluacion,
+                    agregar_a_historial_eventos=evaluacion.es_alto_potencial,
+                )
+                if evaluacion.es_alto_potencial:
+                    self.ultimos_eventos_potenciales.append(snap)
                 hubo_evento_mostrado = True
                 continue
 
-            # Reglas de disparo en ciclos subsecuentes (Ciclo 2+):
+            # Guardar siempre la instantánea más reciente para consultas de contexto AI
+            self._registrar_instantanea(
+                ahora_str, simbolo, indicadores, flujo, evaluacion, agregar_a_historial_eventos=False
+            )
+
+            # Si la acción es errática, queda descartada de cualquier disparo
+            if flujo.estabilidad.es_erratica:
+                continue
+
             ultimo_disp = self.ultimo_disparo_potencial.get(simbolo)
             en_cooldown = (
                 ultimo_disp is not None
@@ -1581,15 +1915,17 @@ class GestorIndicadores:
                 tiene_evento_validado = True
 
             if tiene_evento_validado:
-                prioridad = abs(evaluacion.score) + (15.0 if cambios_frescos else 0.0)
+                prioridad = (
+                    abs(evaluacion.score)
+                    + flujo.estabilidad.indice_certeza * 0.25
+                    + (15.0 if cambios_frescos else 0.0)
+                )
                 candidatos_potencial.append(
                     (prioridad, simbolo, indicadores, flujo, evaluacion)
                 )
 
-        # En ciclos subsecuentes, mostrar los eventos validados ordenados por mayor convicción
         if not self.primera_ejecucion and candidatos_potencial:
             candidatos_potencial.sort(key=lambda x: x[0], reverse=True)
-            # Mostrar hasta las 3 mejores oportunidades validadas por ciclo para claridad en CLI
             for _, simbolo, indicadores, flujo, evaluacion in candidatos_potencial[:3]:
                 self._imprimir_bloque_accion(
                     ahora_str, simbolo, indicadores, flujo, evaluacion
@@ -1602,6 +1938,15 @@ class GestorIndicadores:
                         self.ciclo_actual,
                         evaluacion.direccion,
                     )
+                snap = self._registrar_instantanea(
+                    ahora_str,
+                    simbolo,
+                    indicadores,
+                    flujo,
+                    evaluacion,
+                    agregar_a_historial_eventos=True,
+                )
+                self.ultimos_eventos_potenciales.append(snap)
                 hubo_evento_mostrado = True
 
         self.primera_ejecucion = False
