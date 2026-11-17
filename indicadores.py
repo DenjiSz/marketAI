@@ -1,1965 +1,1072 @@
+# -*- coding: utf-8 -*-
 """
-Módulo indicadores.py
-Motor cuantitativo de indicadores técnicos, flujo institucional, filtro de estabilidad
-anti-errático y detección de "EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA".
+indicadores.py
+==============
+Motor cuantitativo de descarga de datos financieros actuales y cálculo vectorizado de
+indicadores técnicos, de tendencia, flujo institucional y estructura de volumen real.
 
-Mecanismos de certeza y descarte de acciones erráticas o volátiles:
-1. Índice de Eficiencia de Kaufman (ER 14): mide el desplazamiento neto dividido por la
-   trayectoria total de ruido. Descarta activos en "serrucho" (ER < 0.18).
-2. Choppiness Index (CHOP 14): cuantifica si el mercado está caótico/congestionado
-   (CHOP > 60) o en tendencia/movimiento limpio (CHOP < 52).
-3. Regresión Lineal R² (20 periodos): mide la fidelidad y limpieza de la trayectoria del
-   precio frente a la dispersión aleatoria.
-4. Volatilidad Relativa Normalizada (NATR %), Tasa de Inversión de Signo (Whipsaw Rate) y
-   Ratio Mecha/Cuerpo: descarta acciones con mechas erráticas, saltos desordenados o
-   cambios bruscos de dirección vela tras vela.
-5. Confirmación de Persistencia Multi-Vela + Flujo Institucional (CMF 20 + FRVP POC/VAH/VAL).
+Incluye:
+- Datos financieros de la empresa: Precio actual, cambio %, P/E (Trailing y Forward),
+  Soporte 1/2, Resistencia 1/2, Capitalización de Mercado, Rango 52 semanas, ATR y Volumen.
+- Los 10 indicadores base especificados con sus cortes exactos:
+  1. Oscilador (contrarian) | RSI(14) | cortes 20/35/65/80
+  2. Oscilador (contrarian) | Stoch(14,3,3) | cortes 10/20/80/90
+  3. Oscilador (contrarian) | Bollinger %B(20,2) | cortes 0/0.2/0.8/1
+  4. Oscilador (contrarian) | MFI(14), con volumen | cortes 15/30/70/85
+  5. Tendencia | EMA 9/21 | spread dividido por ATR
+  6. Tendencia | MACD histograma | dividido por ATR
+  7. Tendencia | VWAP de sesión | z-score de la distancia %
+  8. Tendencia | ADX/DI | DI+ − DI−, vale 0 si ADX < 20
+  9. Supertrend(10,2.5)/ATR
+  10. CMF(20) Flujo Inst.
+- Indicadores adicionales estructurales y de volumen real para mayor precisión:
+  11. Volumen Real | RVOL(20) Impulso Direccional
+  12. Volumen Real | OBV Z-Score(20) Acumulación
+  13. Estructural | Rango S/R & Ruptura (BOS)
+
+Filtra eventos con nivel de certeza/potencial y solo emite a la terminal secundaria `/datos`
+aquellos activos que alcanzan alto potencial operativo según el modo (`spot` o `short y long`).
 """
 
 from __future__ import annotations
 
-import datetime as dt
-import hashlib
-import json
+import logging
 import math
-import random
+import threading
 import time
-import urllib.parse
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass, field
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+import warnings
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict, dataclass, field
+from typing import Callable, Dict, List, Optional, Tuple
 
-import colorama
-import requests
+import numpy as np
+import pandas as pd
+import yfinance as yf
 
-from infomarket import EMPRESAS, GestorInfoMarket, formatear_fecha, resaltar_azul
+from config import (
+    INTERVALO_CICLO_INDICADORES_SEG,
+    UMBRAL_CERTEZA_EVENTO_TECNICO,
+    UMBRAL_POTENCIAL_DATOS_TERMINAL,
+    formatear_fecha_hora_ampm,
+    simbolo_yfinance,
+)
+from historial import GestorHistorial
 
-colorama.init(autoreset=True)
-
-
-# =====================================================================
-# COLORES ANSI PARA INDICADORES Y EVENTOS
-# =====================================================================
-class ColoresIndicadores:
-    RESET = "\033[0m"
-    # Resaltado azul turquesa fijo para el símbolo de la acción en indicadores
-    TURQUESA_RESALTADO = "\033[1;97;48;5;37m"
-
-    # Semáforo de resultados de cada indicador:
-    ROJO = "\033[1;38;5;196m"          # venta fuerte
-    NARANJA = "\033[1;38;5;208m"       # venta
-    AMARILLO = "\033[1;38;5;226m"      # neutral
-    VERDE_LIGERO = "\033[1;38;5;120m"  # compra
-    VERDE_FUERTE = "\033[1;38;5;46m"   # compra fuerte
-
-    # Resaltado del nombre del indicador que cambió y es motivo de compra o venta:
-    RESALTADO_COMPRA_INDICADOR = "\033[1;97;42m"  # Fondo verde, texto blanco brillante
-    RESALTADO_VENTA_INDICADOR = "\033[1;97;41m"   # Fondo rojo, texto blanco brillante
-
-    CIAN = "\033[1;36m"
+# Silenciar trazas internas de yfinance/pandas para no ensuciar nunca la interfaz TUI
+logging.getLogger("yfinance").setLevel(logging.CRITICAL)
+logging.getLogger("urllib3").setLevel(logging.CRITICAL)
+warnings.filterwarnings("ignore", category=FutureWarning)
 
 
-MAPA_COLOR_RESULTADO: Dict[str, str] = {
-    "venta fuerte": ColoresIndicadores.ROJO,
-    "venta": ColoresIndicadores.NARANJA,
-    "neutral": ColoresIndicadores.AMARILLO,
-    "compra": ColoresIndicadores.VERDE_LIGERO,
-    "compra fuerte": ColoresIndicadores.VERDE_FUERTE,
-}
-
-
-def resaltar_turquesa(simbolo: str) -> str:
-    """
-    Resalta el símbolo de la acción en azul turquesa fijo para diferenciarlo
-    visualmente de noticias (morado) y de etiquetas de estado (azul).
-    """
-    return f"{ColoresIndicadores.TURQUESA_RESALTADO} {simbolo} {ColoresIndicadores.RESET}"
-
-
-def colorear_segun_resultado(texto: str, resultado: str) -> str:
-    color = MAPA_COLOR_RESULTADO.get(resultado.lower(), ColoresIndicadores.AMARILLO)
-    return f"{color}{texto}{ColoresIndicadores.RESET}"
-
-
-def colorear_nombre_indicador(nombre: str, cambio_motivo: Optional[str]) -> str:
-    """
-    Cuando hay un evento de compra o venta por indicadores, el nombre del indicador
-    que cambió y es motivo de compra o venta se resalta en verde para compra y rojo para venta.
-    """
-    if cambio_motivo == "compra":
-        return f"{ColoresIndicadores.RESALTADO_COMPRA_INDICADOR} {nombre} {ColoresIndicadores.RESET}"
-    if cambio_motivo == "venta":
-        return f"{ColoresIndicadores.RESALTADO_VENTA_INDICADOR} {nombre} {ColoresIndicadores.RESET}"
-    return nombre
-
-
-# =====================================================================
-# ESTRUCTURAS DE DATOS
-# =====================================================================
-@dataclass
-class SerieOHLCV:
-    timestamps: List[int]
-    opens: List[float]
-    highs: List[float]
-    lows: List[float]
-    closes: List[float]
-    volumes: List[float]
-
-    def __len__(self) -> int:
-        return len(self.closes)
-
-    def clonar(self) -> "SerieOHLCV":
-        return SerieOHLCV(
-            timestamps=list(self.timestamps),
-            opens=list(self.opens),
-            highs=list(self.highs),
-            lows=list(self.lows),
-            closes=list(self.closes),
-            volumes=list(self.volumes),
-        )
-
+# ==============================================================================
+# 1. ESTRUCTURAS DE DATOS DE INDICADORES Y SNAPSHOT FINANCIERO
+# ==============================================================================
 
 @dataclass
 class ResultadoIndicador:
-    nombre: str
-    tipo: str  # "oscilador" o "tendencia"
-    valor: float
-    resultado: str  # "venta fuerte", "venta", "neutral", "compra", "compra fuerte"
-    cambio_motivo: Optional[str] = None  # "compra", "venta" o None
+    """Resultado individual de un indicador técnico/estructural con su evaluación y alarma."""
 
-    def a_dict(self) -> Dict[str, object]:
-        return {
-            "nombre": self.nombre,
-            "tipo": self.tipo,
-            "valor": round(self.valor, 4),
-            "resultado": self.resultado,
-            "cambio_motivo": self.cambio_motivo,
-        }
+    categoria: str          # Ej. "Oscilador (contrarian)", "Tendencia", "Flujo Inst.", "Volumen Real", "Estructural"
+    nombre: str             # Ej. "RSI(14)"
+    valor: float            # Valor numérico principal calculado
+    texto_valor: str        # Representación legible con unidades o cortes
+    evaluacion: str         # "COMPRA FUERTE" | "COMPRA" | "NEUTRAL" | "VENTA" | "VENTA FUERTE"
+    puntaje: float          # Escala normalizada [-2.0, +2.0] para confluencia
+    alarma: Optional[str]   # "COMPRA" | "VENTA" | None (resalta nombre en verde o rojo)
+
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
 @dataclass
-class MetricasEstabilidad:
-    efficiency_ratio: float       # Kaufman ER [0..1] (alto = movimiento limpio; <0.18 = errático)
-    choppiness_index: float       # CHOP [0..100] (<50 = direccional; >60 = caótico/lateral)
-    r2_tendencia: float           # Linealidad de la trayectoria [0..1]
-    natr_pct: float               # ATR / Precio en % (volatilidad relativa por barra)
-    tasa_whipsaw: float           # % de cambios de signo vela a vela (serrucho)
-    ratio_mecha_cuerpo: float     # Mechas desproporcionadas frente al cuerpo
-    persistencia_direccion: int   # Barras recientes consistentes con la dirección (-3 a +3)
-    es_erratica: bool             # True si debe descartarse por comportamiento errático/volátil
-    indice_certeza: float         # Puntaje de calidad/estabilidad del comportamiento [0..100]
-    motivo_descarte: str = ""
+class DatosFinancieros:
+    """Datos fundamentales y niveles estructurales clave de una acción."""
 
-    def a_dict(self) -> Dict[str, object]:
-        return {
-            "efficiency_ratio": round(self.efficiency_ratio, 3),
-            "choppiness_index": round(self.choppiness_index, 2),
-            "r2_tendencia": round(self.r2_tendencia, 3),
-            "natr_pct": round(self.natr_pct, 3),
-            "tasa_whipsaw": round(self.tasa_whipsaw, 3),
-            "ratio_mecha_cuerpo": round(self.ratio_mecha_cuerpo, 2),
-            "persistencia_direccion": self.persistencia_direccion,
-            "es_erratica": self.es_erratica,
-            "indice_certeza": round(self.indice_certeza, 1),
-            "motivo_descarte": self.motivo_descarte,
-        }
-
-
-@dataclass
-class EvaluacionAltoPotencial:
-    es_alto_potencial: bool
-    direccion: Optional[str]  # "compra" o "venta"
-    etiqueta_cli: str  # "evento con alto potencial de compra" / "evento con alto potencial de venta"
-    score: float  # -100 a +100
-    confianza_pct: float  # 0 a 100%
-    certeza_estabilidad_pct: float  # 0 a 100%
-    regimen: str
-    indicadores_a_favor: int
-    total_indicadores: int
-    ratio_riesgo_beneficio: float
-    stop_loss: float
-    take_profit: float
-    razones_clave: List[str] = field(default_factory=list)
-
-    def a_dict(self) -> Dict[str, object]:
-        return {
-            "es_alto_potencial": self.es_alto_potencial,
-            "direccion": self.direccion,
-            "etiqueta_cli": self.etiqueta_cli,
-            "score": round(self.score, 2),
-            "confianza_pct": round(self.confianza_pct, 1),
-            "certeza_estabilidad_pct": round(self.certeza_estabilidad_pct, 1),
-            "regimen": self.regimen,
-            "indicadores_a_favor": self.indicadores_a_favor,
-            "total_indicadores": self.total_indicadores,
-            "ratio_riesgo_beneficio": round(self.ratio_riesgo_beneficio, 2),
-            "stop_loss": round(self.stop_loss, 2),
-            "take_profit": round(self.take_profit, 2),
-            "razones_clave": list(self.razones_clave),
-        }
-
-
-@dataclass
-class AnalisisFlujoYFundamentales:
-    simbolo: str
+    ticker: str
     precio_actual: float
-    cambio_pct_barra: float
-    cambio_pct_sesion: float
-    atr_actual: float
-    adx_actual: float
-    cmf_actual: float
-    divergencia: Optional[str]
-    estabilidad: MetricasEstabilidad
-    # Perfil de Volumen de Rango Fijo (FRVP)
-    poc: float
-    vah: float
-    val: float
-    rvol: float
-    estado_volumen: str
-    # Soportes y Resistencias
+    cambio_diario_pct: float
+    pe_ratio: Optional[float]
+    pe_forward: Optional[float]
     soporte_1: float
     soporte_2: float
     resistencia_1: float
     resistencia_2: float
-    dist_soporte_pct: float
-    dist_resistencia_pct: float
-    # Fundamentales y métricas relevantes
-    pe_trailing: Optional[float]
-    pe_forward: Optional[float]
+    vwap_sesion: float
+    atr_14: float
+    volumen_barra: float
+    volumen_promedio_20: float
+    cap_mercado_b: Optional[float]   # En miles de millones (Billions USD)
+    max_52_semanas: Optional[float]
+    min_52_semanas: Optional[float]
     beta: Optional[float]
-    pos_rango_52s_pct: float
-    # Alertas de flujo / precio abrupto / fundamentales
-    alerta_abrupta: Optional[str] = None
-    tipo_alerta: Optional[str] = None  # "compra" o "venta"
-    analisis_fundamental_sr: str = ""
-    noticias_asociadas: List[str] = field(default_factory=list)
 
-    def a_dict(self) -> Dict[str, object]:
-        return {
-            "simbolo": self.simbolo,
-            "precio_actual": round(self.precio_actual, 2),
-            "cambio_pct_barra": round(self.cambio_pct_barra, 3),
-            "cambio_pct_sesion": round(self.cambio_pct_sesion, 3),
-            "atr_actual": round(self.atr_actual, 4),
-            "adx_actual": round(self.adx_actual, 2),
-            "cmf_actual": round(self.cmf_actual, 3),
-            "divergencia": self.divergencia,
-            "estabilidad": self.estabilidad.a_dict(),
-            "frvp": {
-                "poc": round(self.poc, 2),
-                "vah": round(self.vah, 2),
-                "val": round(self.val, 2),
-                "rvol": round(self.rvol, 2),
-                "estado_volumen": self.estado_volumen,
-            },
-            "soporte_resistencia": {
-                "soporte_1": round(self.soporte_1, 2),
-                "soporte_2": round(self.soporte_2, 2),
-                "resistencia_1": round(self.resistencia_1, 2),
-                "resistencia_2": round(self.resistencia_2, 2),
-                "dist_soporte_pct": round(self.dist_soporte_pct, 2),
-                "dist_resistencia_pct": round(self.dist_resistencia_pct, 2),
-            },
-            "fundamentales": {
-                "pe_trailing": self.pe_trailing,
-                "pe_forward": self.pe_forward,
-                "beta": self.beta,
-                "pos_rango_52s_pct": round(self.pos_rango_52s_pct, 1),
-            },
-            "alerta_abrupta": self.alerta_abrupta,
-            "tipo_alerta": self.tipo_alerta,
-        }
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
 @dataclass
-class InstantaneaEventoTecnico:
-    """Registro estructurado de un evento técnico validado para una acción."""
-    timestamp: str
-    ciclo: int
-    simbolo: str
+class AnalisisTecnicoTicker:
+    """Paquete completo financiero + 13 indicadores + evaluación de certeza/potencial."""
+
+    ticker: str
+    epoch: float
+    fecha_hora_ampm: str
+    datos_financieros: DatosFinancieros
     indicadores: List[ResultadoIndicador]
-    flujo: AnalisisFlujoYFundamentales
-    evaluacion: EvaluacionAltoPotencial
+    evaluacion_general: str          # "COMPRA FUERTE" | "COMPRA" | "NEUTRAL" | "VENTA" | "VENTA FUERTE"
+    direccion_potencial: str         # "ALCISTA" | "BAJISTA" | "NEUTRAL"
+    potencial_score: float           # 0.0 - 100.0
+    certeza_pct: float               # 0.0 - 100.0
+    alarmas_compra: List[str] = field(default_factory=list)
+    alarmas_venta: List[str] = field(default_factory=list)
+    es_evento_alto_potencial: bool = False
+    motivo_evento: str = ""
+
+    def to_dict(self) -> Dict:
+        return {
+            "ticker": self.ticker,
+            "epoch": self.epoch,
+            "fecha_hora_ampm": self.fecha_hora_ampm,
+            "datos_financieros": self.datos_financieros.to_dict(),
+            "indicadores": [ind.to_dict() for ind in self.indicadores],
+            "evaluacion_general": self.evaluacion_general,
+            "direccion_potencial": self.direccion_potencial,
+            "potencial_score": self.potencial_score,
+            "certeza_pct": self.certeza_pct,
+            "alarmas_compra": self.alarmas_compra,
+            "alarmas_venta": self.alarmas_venta,
+            "es_evento_alto_potencial": self.es_evento_alto_potencial,
+            "motivo_evento": self.motivo_evento,
+        }
 
 
-# =====================================================================
-# FUNCIONES MATEMÁTICAS DE INDICADORES, ESTABILIDAD Y VOLUMEN
-# =====================================================================
-def clasificar_contrarian(
-    valor: float, c1: float, c2: float, c3: float, c4: float
-) -> str:
-    if math.isnan(valor):
-        return "neutral"
-    if valor < c1:
-        return "compra fuerte"
-    if valor < c2:
-        return "compra"
-    if valor <= c3:
-        return "neutral"
-    if valor <= c4:
-        return "venta"
-    return "venta fuerte"
+# ==============================================================================
+# 2. FUNCIONES MATEMÁTICAS VECTORIZADAS (NUMPY / PANDAS)
+# ==============================================================================
+
+def _safe_float(val: object, default: float = 0.0) -> float:
+    try:
+        f = float(val)
+        return default if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return default
 
 
-def clasificar_tendencia(
-    valor: float, c1: float, c2: float, c3: float, c4: float
-) -> str:
-    if math.isnan(valor):
-        return "neutral"
-    if valor < c1:
-        return "venta fuerte"
-    if valor < c2:
-        return "venta"
-    if valor <= c3:
-        return "neutral"
-    if valor <= c4:
-        return "compra"
-    return "compra fuerte"
+def calcular_atr(high: pd.Series, low: pd.Series, close: pd.Series, periodo: int = 14) -> pd.Series:
+    """Average True Range (Wilder)."""
+    prev_close = close.shift(1)
+    tr = pd.concat(
+        [
+            (high - low).abs(),
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return tr.ewm(alpha=1.0 / periodo, min_periods=periodo, adjust=False).mean()
 
 
-def _ema_series(valores: List[float], alpha: float) -> List[float]:
-    if not valores:
-        return []
-    res = [valores[0]]
-    for v in valores[1:]:
-        res.append(alpha * v + (1.0 - alpha) * res[-1])
-    return res
+def calcular_rsi(close: pd.Series, periodo: int = 14) -> float:
+    """RSI(14) clásico con suavizado exponencial de Wilder."""
+    delta = close.diff()
+    ganancia = delta.clip(lower=0.0)
+    perdida = (-delta).clip(lower=0.0)
+    avg_gain = ganancia.ewm(alpha=1.0 / periodo, min_periods=periodo, adjust=False).mean()
+    avg_loss = perdida.ewm(alpha=1.0 / periodo, min_periods=periodo, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    rsi = rsi.fillna(50.0)
+    return _safe_float(rsi.iloc[-1], 50.0)
 
 
-def _media(valores: List[float]) -> float:
-    return sum(valores) / len(valores) if valores else 0.0
+def calcular_stoch(high: pd.Series, low: pd.Series, close: pd.Series, k_len: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> Tuple[float, float]:
+    """Stochastic Oscillator (14, 3, 3) -> devuelve (%K suavizado, %D)."""
+    lowest_low = low.rolling(window=k_len, min_periods=max(5, k_len // 2)).min()
+    highest_high = high.rolling(window=k_len, min_periods=max(5, k_len // 2)).max()
+    rango = (highest_high - lowest_low).replace(0.0, np.nan)
+    raw_k = 100.0 * (close - lowest_low) / rango
+    k = raw_k.rolling(window=k_smooth, min_periods=1).mean().fillna(50.0)
+    d = k.rolling(window=d_smooth, min_periods=1).mean().fillna(50.0)
+    return _safe_float(k.iloc[-1], 50.0), _safe_float(d.iloc[-1], 50.0)
 
 
-def _std_poblacional(valores: List[float]) -> float:
-    if len(valores) < 2:
-        return 0.0
-    m = _media(valores)
-    var = sum((x - m) ** 2 for x in valores) / len(valores)
-    return math.sqrt(var)
+def calcular_bollinger_pct_b(close: pd.Series, periodo: int = 20, mult: float = 2.0) -> float:
+    """Bollinger %B(20, 2) = (Close - BandaInferior) / (BandaSuperior - BandaInferior)."""
+    sma = close.rolling(window=periodo, min_periods=max(5, periodo // 2)).mean()
+    std = close.rolling(window=periodo, min_periods=max(5, periodo // 2)).std(ddof=0)
+    upper = sma + mult * std
+    lower = sma - mult * std
+    ancho = (upper - lower).replace(0.0, np.nan)
+    pct_b = ((close - lower) / ancho).fillna(0.5)
+    return _safe_float(pct_b.iloc[-1], 0.5)
 
 
-def calcular_atr_lista(serie: SerieOHLCV, periodo: int = 14) -> List[float]:
-    n = len(serie)
-    if n == 0:
-        return []
-    trs: List[float] = [serie.highs[0] - serie.lows[0]]
-    for i in range(1, n):
-        hl = serie.highs[i] - serie.lows[i]
-        hc = abs(serie.highs[i] - serie.closes[i - 1])
-        lc = abs(serie.lows[i] - serie.closes[i - 1])
-        trs.append(max(hl, hc, lc))
-    return _ema_series(trs, 1.0 / periodo)
+def calcular_mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, periodo: int = 14) -> float:
+    """Money Flow Index MFI(14) ponderado por volumen."""
+    tp = (high + low + close) / 3.0
+    rmf = tp * volume.clip(lower=0.0)
+    diff_tp = tp.diff()
+    pos_mf = rmf.where(diff_tp > 0.0, 0.0).rolling(window=periodo, min_periods=max(5, periodo // 2)).sum()
+    neg_mf = rmf.where(diff_tp < 0.0, 0.0).rolling(window=periodo, min_periods=max(5, periodo // 2)).sum()
+    mfr = pos_mf / neg_mf.replace(0.0, np.nan)
+    mfi = 100.0 - (100.0 / (1.0 + mfr))
+    mfi = mfi.fillna(50.0)
+    return _safe_float(mfi.iloc[-1], 50.0)
 
 
-def calcular_rsi_serie(closes: List[float], periodo: int = 14) -> List[float]:
-    if len(closes) < 2:
-        return [50.0] * len(closes)
-    gains: List[float] = [0.0]
-    losses: List[float] = [0.0]
-    for i in range(1, len(closes)):
-        diff = closes[i] - closes[i - 1]
-        gains.append(diff if diff > 0 else 0.0)
-        losses.append(-diff if diff < 0 else 0.0)
-
-    avg_gains = _ema_series(gains, 1.0 / periodo)
-    avg_losses = _ema_series(losses, 1.0 / periodo)
-    rsis: List[float] = []
-    for ag, al in zip(avg_gains, avg_losses):
-        if al == 0:
-            rsis.append(100.0 if ag > 0 else 50.0)
-        else:
-            rs = ag / al
-            rsis.append(100.0 - (100.0 / (1.0 + rs)))
-    return rsis
-
-
-def calcular_rsi(closes: List[float], periodo: int = 14) -> float:
-    rsis = calcular_rsi_serie(closes, periodo=periodo)
-    return rsis[-1] if rsis else 50.0
-
-
-def calcular_stoch(
-    serie: SerieOHLCV, k_period: int = 14, k_smooth: int = 3, d_smooth: int = 3
-) -> float:
-    n = len(serie)
-    if n == 0:
-        return 50.0
-    fast_k: List[float] = []
-    for i in range(n):
-        ini = max(0, i - k_period + 1)
-        low_min = min(serie.lows[ini : i + 1])
-        high_max = max(serie.highs[ini : i + 1])
-        rango = high_max - low_min
-        if rango <= 0:
-            fast_k.append(50.0)
-        else:
-            fast_k.append(100.0 * (serie.closes[i] - low_min) / rango)
-
-    slow_k: List[float] = []
-    for i in range(n):
-        ini = max(0, i - k_smooth + 1)
-        slow_k.append(_media(fast_k[ini : i + 1]))
-
-    _ = _media(slow_k[max(0, n - d_smooth) :])
-    return slow_k[-1]
-
-
-def calcular_bollinger_pct_b(
-    closes: List[float], periodo: int = 20, num_std: float = 2.0
-) -> float:
-    ventana = closes[-periodo:] if len(closes) >= periodo else closes
-    if len(ventana) < 2:
-        return 0.5
-    sma = _media(ventana)
-    std = _std_poblacional(ventana)
-    upper = sma + num_std * std
-    lower = sma - num_std * std
-    ancho = upper - lower
-    if ancho <= 0:
-        return 0.5
-    return (closes[-1] - lower) / ancho
-
-
-def calcular_mfi(serie: SerieOHLCV, periodo: int = 14) -> float:
-    n = len(serie)
-    if n < 2:
-        return 50.0
-    tps = [(serie.highs[i] + serie.lows[i] + serie.closes[i]) / 3.0 for i in range(n)]
-    pos_mf: List[float] = []
-    neg_mf: List[float] = []
-    for i in range(1, n):
-        rmf = tps[i] * max(0.0, serie.volumes[i])
-        if tps[i] > tps[i - 1]:
-            pos_mf.append(rmf)
-            neg_mf.append(0.0)
-        elif tps[i] < tps[i - 1]:
-            pos_mf.append(0.0)
-            neg_mf.append(rmf)
-        else:
-            pos_mf.append(0.0)
-            neg_mf.append(0.0)
-
-    sum_pos = sum(pos_mf[-periodo:])
-    sum_neg = sum(neg_mf[-periodo:])
-    if sum_neg == 0:
-        return 100.0 if sum_pos > 0 else 50.0
-    mfr = sum_pos / sum_neg
-    return 100.0 - (100.0 / (1.0 + mfr))
-
-
-def calcular_ema_spread_atr(closes: List[float], atr_series: List[float]) -> float:
-    if not closes or not atr_series:
-        return 0.0
-    ema9 = _ema_series(closes, 2.0 / (9.0 + 1.0))[-1]
-    ema21 = _ema_series(closes, 2.0 / (21.0 + 1.0))[-1]
-    atr_val = atr_series[-1]
-    if atr_val <= 0:
-        return 0.0
-    return (ema9 - ema21) / atr_val
-
-
-def calcular_macd_hist_atr(closes: List[float], atr_series: List[float]) -> float:
-    if not closes or not atr_series:
-        return 0.0
-    ema12 = _ema_series(closes, 2.0 / (12.0 + 1.0))
-    ema26 = _ema_series(closes, 2.0 / (26.0 + 1.0))
-    macd = [a - b for a, b in zip(ema12, ema26)]
-    signal = _ema_series(macd, 2.0 / (9.0 + 1.0))
-    hist = macd[-1] - signal[-1]
-    atr_val = atr_series[-1]
-    if atr_val <= 0:
-        return 0.0
-    return hist / atr_val
-
-
-def calcular_vwap_zscore(serie: SerieOHLCV, ventana_z: int = 20) -> float:
-    n = len(serie)
-    if n < 3:
-        return 0.0
-
-    pv_acum = 0.0
-    v_acum = 0.0
-    dia_actual: Optional[dt.date] = None
-    dist_pcts: List[float] = []
-
-    for i in range(n):
-        ts = serie.timestamps[i]
-        dia_barra = dt.datetime.fromtimestamp(ts, tz=dt.timezone.utc).date()
-        if dia_actual != dia_barra:
-            dia_actual = dia_barra
-            pv_acum = 0.0
-            v_acum = 0.0
-
-        tp = (serie.highs[i] + serie.lows[i] + serie.closes[i]) / 3.0
-        vol = max(1.0, serie.volumes[i])
-        pv_acum += tp * vol
-        v_acum += vol
-        vwap = pv_acum / v_acum if v_acum > 0 else serie.closes[i]
-        dist_pct = ((serie.closes[i] - vwap) / vwap) * 100.0 if vwap > 0 else 0.0
-        dist_pcts.append(dist_pct)
-
-    ventana = dist_pcts[-ventana_z:]
-    std = _std_poblacional(ventana)
-    if std <= 0:
-        return 0.0
-    media = _media(ventana)
-    return (ventana[-1] - media) / std
-
-
-def calcular_adx_di(
-    serie: SerieOHLCV, periodo: int = 14
-) -> Tuple[float, float, float, float]:
-    n = len(serie)
-    if n < 2:
-        return 0.0, 0.0, 0.0, 0.0
-
-    plus_dm: List[float] = [0.0]
-    minus_dm: List[float] = [0.0]
-    for i in range(1, n):
-        up_move = serie.highs[i] - serie.highs[i - 1]
-        down_move = serie.lows[i - 1] - serie.lows[i]
-        plus_dm.append(up_move if (up_move > down_move and up_move > 0) else 0.0)
-        minus_dm.append(down_move if (down_move > up_move and down_move > 0) else 0.0)
-
-    atr_s = calcular_atr_lista(serie, periodo=periodo)
-    alpha = 1.0 / periodo
-    smooth_plus = _ema_series(plus_dm, alpha)
-    smooth_minus = _ema_series(minus_dm, alpha)
-
-    plus_di_s: List[float] = []
-    minus_di_s: List[float] = []
-    dx_s: List[float] = []
-
-    for i in range(n):
-        atr_val = atr_s[i] if atr_s[i] > 0 else 1e-9
-        p_di = 100.0 * (smooth_plus[i] / atr_val)
-        m_di = 100.0 * (smooth_minus[i] / atr_val)
-        plus_di_s.append(p_di)
-        minus_di_s.append(m_di)
-        suma = p_di + m_di
-        dx_s.append(100.0 * abs(p_di - m_di) / suma if suma > 0 else 0.0)
-
-    adx_s = _ema_series(dx_s, alpha)
-    adx_val = adx_s[-1]
-    p_di_val = plus_di_s[-1]
-    m_di_val = minus_di_s[-1]
-
-    valor = 0.0 if adx_val < 20.0 else (p_di_val - m_di_val)
-    return valor, adx_val, p_di_val, m_di_val
-
-
-def calcular_cmf(serie: SerieOHLCV, periodo: int = 20) -> float:
-    n = len(serie)
-    if n == 0:
-        return 0.0
-    ini = max(0, n - periodo)
-    mfv_sum = 0.0
-    vol_sum = 0.0
-    for i in range(ini, n):
-        h = serie.highs[i]
-        l = serie.lows[i]
-        c = serie.closes[i]
-        v = max(0.0, serie.volumes[i])
-        rango = h - l
-        if rango > 0:
-            mf_mult = ((c - l) - (h - c)) / rango
-        else:
-            mf_mult = 0.0
-        mfv_sum += mf_mult * v
-        vol_sum += v
-    return (mfv_sum / vol_sum) if vol_sum > 0 else 0.0
-
-
-def calcular_supertrend_dist_atr(
-    serie: SerieOHLCV, periodo_atr: int = 10, multiplicador: float = 2.5
-) -> float:
-    n = len(serie)
-    if n < 2:
-        return 0.0
-    atr_s = calcular_atr_lista(serie, periodo=periodo_atr)
-    final_upper = 0.0
-    final_lower = 0.0
-    tendencia = 1
-
-    for i in range(n):
-        hl2 = 0.5 * (serie.highs[i] + serie.lows[i])
-        basic_upper = hl2 + multiplicador * atr_s[i]
-        basic_lower = hl2 - multiplicador * atr_s[i]
-
-        if i == 0:
-            final_upper = basic_upper
-            final_lower = basic_lower
-            tendencia = 1
-            continue
-
-        prev_close = serie.closes[i - 1]
-        if basic_upper < final_upper or prev_close > final_upper:
-            final_upper = basic_upper
-        if basic_lower > final_lower or prev_close < final_lower:
-            final_lower = basic_lower
-
-        c = serie.closes[i]
-        if tendencia == 1 and c < final_lower:
-            tendencia = -1
-        elif tendencia == -1 and c > final_upper:
-            tendencia = 1
-
-    atr_actual = atr_s[-1] if atr_s[-1] > 0 else 1e-9
-    c_actual = serie.closes[-1]
-    banda_activa = final_lower if tendencia == 1 else final_upper
-    dist_atr = (c_actual - banda_activa) / atr_actual
-    return dist_atr if tendencia == 1 else -abs(dist_atr)
-
-
-# =====================================================================
-# NUEVOS MECANISMOS ANTI-ERRÁTICOS Y DE CERTEZA ESTRUCTURAL
-# =====================================================================
-def calcular_efficiency_ratio(closes: List[float], periodo: int = 14) -> float:
+def calcular_adx_di(high: pd.Series, low: pd.Series, close: pd.Series, periodo: int = 14) -> Tuple[float, float, float, float]:
     """
-    Índice de Eficiencia de Kaufman (ER):
-    ER = |Close_t - Close_{t-N}| / Sum(|Close_i - Close_{i-1}|)
-    - Cercano a 1.0: tendencia limpia sin ruido.
-    - Menor a 0.18: comportamiento errático ("serrucho" o whipsaw).
+    Calcula ADX(14), DI+(14), DI-(14) y el valor reglado:
+    `DI+ - DI-`, que vale exactamente `0.0` si `ADX < 20`.
     """
-    if len(closes) <= periodo:
-        return 0.5
-    sub = closes[-(periodo + 1) :]
-    cambio_neto = abs(sub[-1] - sub[0])
-    recorrido_total = sum(abs(sub[i] - sub[i - 1]) for i in range(1, len(sub)))
-    if recorrido_total <= 0:
-        return 0.0
-    return max(0.0, min(1.0, cambio_neto / recorrido_total))
+    up_move = high.diff()
+    down_move = -low.diff()
 
-
-def calcular_choppiness_index(serie: SerieOHLCV, periodo: int = 14) -> float:
-    """
-    Choppiness Index (CHOP 14):
-    100 * log10(Sum(TR, 14) / (MaxHigh_14 - MinLow_14)) / log10(14)
-    - Valores > 61.8 indican congestión caótica/errática.
-    - Valores < 50.0 (especialmente < 38.2) indican movimiento direccional ordenado.
-    """
-    n = len(serie)
-    if n <= periodo:
-        return 50.0
-    ini = n - periodo
-    trs: List[float] = []
-    for i in range(ini, n):
-        hl = serie.highs[i] - serie.lows[i]
-        hc = abs(serie.highs[i] - serie.closes[i - 1])
-        lc = abs(serie.lows[i] - serie.closes[i - 1])
-        trs.append(max(hl, hc, lc))
-    suma_tr = sum(trs)
-    rango_hl = max(serie.highs[ini:]) - min(serie.lows[ini:])
-    if rango_hl <= 0 or suma_tr <= 0:
-        return 50.0
-    ratio = max(1.0, suma_tr / rango_hl)
-    chop = 100.0 * math.log10(ratio) / math.log10(float(periodo))
-    return max(0.0, min(100.0, chop))
-
-
-def calcular_r2_tendencia(closes: List[float], periodo: int = 20) -> float:
-    """
-    Coeficiente de determinación R² de la regresión lineal de los precios de cierre:
-    Cuantifica qué tan predecible y estable es la pendiente del precio frente a la varianza.
-    """
-    sub = closes[-periodo:] if len(closes) >= periodo else closes
-    n = len(sub)
-    if n < 5:
-        return 0.5
-    xs = [float(i) for i in range(n)]
-    mx = _media(xs)
-    my = _media(sub)
-    num = sum((x - mx) * (y - my) for x, y in zip(xs, sub))
-    den_x = sum((x - mx) ** 2 for x in xs)
-    den_y = sum((y - my) ** 2 for y in sub)
-    if den_x <= 0 or den_y <= 0:
-        return 0.0
-    r = num / math.sqrt(den_x * den_y)
-    return max(0.0, min(1.0, r * r))
-
-
-def evaluar_estabilidad_accion(
-    serie: SerieOHLCV, atr_series: List[float], ventana: int = 16
-) -> MetricasEstabilidad:
-    """
-    Evalúa integralmente si una acción tiene un comportamiento estable/confiable
-    o si debe descartarse por comportamiento altamente errático o volátil.
-    """
-    closes = serie.closes
-    precio_actual = closes[-1] if closes else 1.0
-    atr_actual = atr_series[-1] if atr_series else 0.01
-
-    er = calcular_efficiency_ratio(closes, periodo=14)
-    chop = calcular_choppiness_index(serie, periodo=14)
-    r2 = calcular_r2_tendencia(closes, periodo=20)
-    natr_pct = (atr_actual / precio_actual) * 100.0 if precio_actual > 0 else 0.0
-
-    # Calcular tasa de inversión de signo (Whipsaw / Flip-Flop Rate) y ratio Mecha/Cuerpo
-    n = len(serie)
-    ini = max(1, n - ventana)
-    cambios_signo = 0
-    total_pares = 0
-    signo_prev = 0
-    ratios_mecha: List[float] = []
-
-    for i in range(ini, n):
-        diff = closes[i] - closes[i - 1]
-        signo = 1 if diff > 0 else (-1 if diff < 0 else 0)
-        if signo != 0 and signo_prev != 0:
-            total_pares += 1
-            if signo != signo_prev:
-                cambios_signo += 1
-        if signo != 0:
-            signo_prev = signo
-
-        cuerpo = abs(serie.closes[i] - serie.opens[i])
-        rango_vela = max(0.0, serie.highs[i] - serie.lows[i])
-        mecha = max(0.0, rango_vela - cuerpo)
-        base_cuerpo = max(cuerpo, precio_actual * 0.0008)
-        ratios_mecha.append(mecha / base_cuerpo)
-
-    tasa_whipsaw = (cambios_signo / total_pares) if total_pares > 0 else 0.5
-    ratio_mecha = _media(ratios_mecha) if ratios_mecha else 1.0
-
-    # Persistencia de dirección en las últimas 3 barras (-3 a +3)
-    persistencia = 0
-    if n >= 4:
-        for i in range(n - 3, n):
-            if closes[i] > closes[i - 1]:
-                persistencia += 1
-            elif closes[i] < closes[i - 1]:
-                persistencia -= 1
-
-    # Condiciones de descarte por comportamiento altamente errático o volátil
-    motivos_erratico: List[str] = []
-    if er < 0.16 and chop > 61.5:
-        motivos_erratico.append(f"Serrucho sin dirección (ER={er:.2f}, CHOP={chop:.1f})")
-    if tasa_whipsaw > 0.72 and r2 < 0.18:
-        motivos_erratico.append(f"Alta inversión errática de velas (Whipsaw={tasa_whipsaw*100:.0f}%)")
-    if natr_pct > 3.6 and r2 < 0.20:
-        motivos_erratico.append(f"Volatilidad desordenada excesiva (NATR={natr_pct:.2f}%)")
-    if ratio_mecha > 4.2 and er < 0.22:
-        motivos_erratico.append(f"Mechas erráticas de barrido (Mecha/Cuerpo={ratio_mecha:.1f}x)")
-
-    es_erratica = len(motivos_erratico) > 0
-
-    # Índice de Certeza Estructural [0..100]
-    pts_er = min(35.0, er * 48.0)
-    pts_chop = max(0.0, min(25.0, (68.0 - chop) * 0.85))
-    pts_r2 = min(25.0, r2 * 30.0)
-    pts_whip = max(0.0, min(15.0, (0.75 - tasa_whipsaw) * 30.0))
-    penalizacion_vol = max(0.0, (natr_pct - 2.2) * 8.0) if natr_pct > 2.2 else 0.0
-
-    indice_certeza = max(5.0, min(99.0, pts_er + pts_chop + pts_r2 + pts_whip - penalizacion_vol))
-    if es_erratica:
-        indice_certeza = min(indice_certeza, 39.0)
-
-    return MetricasEstabilidad(
-        efficiency_ratio=er,
-        choppiness_index=chop,
-        r2_tendencia=r2,
-        natr_pct=natr_pct,
-        tasa_whipsaw=tasa_whipsaw,
-        ratio_mecha_cuerpo=ratio_mecha,
-        persistencia_direccion=persistencia,
-        es_erratica=es_erratica,
-        indice_certeza=indice_certeza,
-        motivo_descarte="; ".join(motivos_erratico) if motivos_erratico else "Comportamiento ordenado",
+    plus_dm = pd.Series(
+        np.where((up_move > down_move) & (up_move > 0.0), up_move, 0.0),
+        index=close.index,
+    )
+    minus_dm = pd.Series(
+        np.where((down_move > up_move) & (down_move > 0.0), down_move, 0.0),
+        index=close.index,
     )
 
+    atr = calcular_atr(high, low, close, periodo=periodo).replace(0.0, np.nan)
+    plus_di = 100.0 * (plus_dm.ewm(alpha=1.0 / periodo, adjust=False).mean() / atr)
+    minus_di = 100.0 * (minus_dm.ewm(alpha=1.0 / periodo, adjust=False).mean() / atr)
 
-def detectar_divergencia_rsi(serie: SerieOHLCV, ventana: int = 18) -> Optional[str]:
-    if len(serie) < ventana:
-        return None
-    closes = serie.closes[-ventana:]
-    rsis = calcular_rsi_serie(serie.closes, periodo=14)[-ventana:]
-    mitad = ventana // 2
+    suma_di = (plus_di + minus_di).replace(0.0, np.nan)
+    dx = 100.0 * (plus_di - minus_di).abs() / suma_di
+    adx = dx.ewm(alpha=1.0 / periodo, adjust=False).mean().fillna(0.0)
 
-    min_p1, min_p2 = min(closes[:mitad]), min(closes[mitad:])
-    min_r1, min_r2 = min(rsis[:mitad]), min(rsis[mitad:])
-    if min_p2 < min_p1 * 0.997 and min_r2 > min_r1 + 2.0 and rsis[-1] < 46.0:
-        return "alcista"
+    adx_val = _safe_float(adx.iloc[-1], 0.0)
+    di_pos_val = _safe_float(plus_di.iloc[-1], 0.0)
+    di_neg_val = _safe_float(minus_di.iloc[-1], 0.0)
 
-    max_p1, max_p2 = max(closes[:mitad]), max(closes[mitad:])
-    max_r1, max_r2 = max(rsis[:mitad]), max(rsis[mitad:])
-    if max_p2 > max_p1 * 1.003 and max_r2 < max_r1 - 2.0 and rsis[-1] > 54.0:
-        return "bajista"
-
-    return None
+    spread_reglado = 0.0 if adx_val < 20.0 else (di_pos_val - di_neg_val)
+    return adx_val, di_pos_val, di_neg_val, spread_reglado
 
 
-def calcular_perfil_volumen_rango_fijo(
-    serie: SerieOHLCV, num_bins: int = 20, ventana_barras: int = 60
-) -> Tuple[float, float, float, float]:
-    n = len(serie)
-    ini = max(0, n - ventana_barras)
-    highs = serie.highs[ini:]
-    lows = serie.lows[ini:]
-    closes = serie.closes[ini:]
-    vols = [max(0.0, v) for v in serie.volumes[ini:]]
+def calcular_supertrend_norm(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    atr_ref: float,
+    periodo: int = 10,
+    multiplicador: float = 2.5,
+) -> Tuple[float, int, bool]:
+    """
+    Calcula Supertrend(10, 2.5) y devuelve:
+    `(distancia_dividida_por_ATR, direccion (+1 alcista / -1 bajista), hubo_cambio_reciente)`.
+    """
+    atr_st = calcular_atr(high, low, close, periodo=periodo).bfill().fillna(max(atr_ref, 0.01))
+    hl2 = (high + low) / 2.0
+    basic_upper = (hl2 + multiplicador * atr_st).to_numpy(dtype=float)
+    basic_lower = (hl2 - multiplicador * atr_st).to_numpy(dtype=float)
+    c_arr = close.to_numpy(dtype=float)
 
-    precio_actual = closes[-1]
-    precio_min = min(lows)
-    precio_max = max(highs)
-    vol_total = sum(vols)
+    n = len(c_arr)
+    if n < 3:
+        return 0.0, 1, False
 
-    if precio_max <= precio_min or vol_total <= 0:
-        return precio_actual, precio_actual * 1.01, precio_actual * 0.99, 1.0
+    final_upper = np.copy(basic_upper)
+    final_lower = np.copy(basic_lower)
+    direccion = np.ones(n, dtype=int)
+    st_line = np.copy(final_lower)
 
-    paso = (precio_max - precio_min) / num_bins
-    edges = [precio_min + i * paso for i in range(num_bins + 1)]
-    centros = [0.5 * (edges[i] + edges[i + 1]) for i in range(num_bins)]
-    vol_por_bin = [0.0] * num_bins
-
-    for h, l, c, v in zip(highs, lows, closes, vols):
-        tp = (h + l + c) / 3.0
-        idx = int((tp - precio_min) / paso)
-        idx = max(0, min(num_bins - 1, idx))
-        vol_por_bin[idx] += v
-
-    poc_idx = max(range(num_bins), key=lambda i: vol_por_bin[i])
-    poc = centros[poc_idx]
-
-    objetivo_va = 0.70 * vol_total
-    acumulado = vol_por_bin[poc_idx]
-    low_idx = poc_idx
-    high_idx = poc_idx
-
-    while acumulado < objetivo_va and (low_idx > 0 or high_idx < num_bins - 1):
-        vol_abajo = vol_por_bin[low_idx - 1] if low_idx > 0 else -1.0
-        vol_arriba = vol_por_bin[high_idx + 1] if high_idx < num_bins - 1 else -1.0
-        if vol_arriba >= vol_abajo and high_idx < num_bins - 1:
-            high_idx += 1
-            acumulado += vol_por_bin[high_idx]
-        elif low_idx > 0:
-            low_idx -= 1
-            acumulado += vol_por_bin[low_idx]
+    for i in range(1, n):
+        if basic_upper[i] < final_upper[i - 1] or c_arr[i - 1] > final_upper[i - 1]:
+            final_upper[i] = basic_upper[i]
         else:
-            break
+            final_upper[i] = final_upper[i - 1]
 
-    val = edges[low_idx]
-    vah = edges[high_idx + 1]
+        if basic_lower[i] > final_lower[i - 1] or c_arr[i - 1] < final_lower[i - 1]:
+            final_lower[i] = basic_lower[i]
+        else:
+            final_lower[i] = final_lower[i - 1]
 
-    vols_previos = vols[-21:-1] if len(vols) > 2 else vols
-    vol_medio_20 = _media(vols_previos)
-    rvol = (vols[-1] / vol_medio_20) if vol_medio_20 > 0 else 1.0
+        if direccion[i - 1] == -1 and c_arr[i] > final_upper[i]:
+            direccion[i] = 1
+        elif direccion[i - 1] == 1 and c_arr[i] < final_lower[i]:
+            direccion[i] = -1
+        else:
+            direccion[i] = direccion[i - 1]
 
-    return poc, vah, val, rvol
+        st_line[i] = final_lower[i] if direccion[i] == 1 else final_upper[i]
 
-
-def calcular_soportes_resistencias(
-    serie: SerieOHLCV, ventana: int = 40
-) -> Tuple[float, float, float, float]:
-    ini = max(0, len(serie) - ventana)
-    high = max(serie.highs[ini:])
-    low = min(serie.lows[ini:])
-    close = serie.closes[-1]
-
-    pivote = (high + low + close) / 3.0
-    r1 = max(2.0 * pivote - low, close * 1.005)
-    s1 = min(2.0 * pivote - high, close * 0.995)
-    r2 = max(pivote + (high - low), r1 * 1.01)
-    s2 = min(pivote - (high - low), s1 * 0.99)
-    return s1, s2, r1, r2
+    denom = max(atr_ref, 1e-6)
+    st_div_atr = (c_arr[-1] - st_line[-1]) / denom
+    cambio_reciente = bool(direccion[-1] != direccion[-2])
+    return _safe_float(st_div_atr, 0.0), int(direccion[-1]), cambio_reciente
 
 
-# =====================================================================
-# GESTOR DE INDICADORES, FLUJO Y CONFLUENCIA DE ALTO POTENCIAL
-# =====================================================================
+def calcular_vwap_sesion_zscore(df: pd.DataFrame) -> Tuple[float, float]:
+    """
+    Calcula el VWAP de la sesión intradía más reciente y el Z-Score de la distancia porcentual
+    `((Close - VWAP) / VWAP) * 100`.
+    """
+    tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
+    vol = df["Volume"].clip(lower=0.0)
+
+    # Aislar las barras de la última fecha de sesión disponible si el índice es temporal
+    if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
+        fechas = df.index.date
+        mask_hoy = fechas == fechas[-1]
+        if int(mask_hoy.sum()) >= 3:
+            tp_ses = tp[mask_hoy]
+            vol_ses = vol[mask_hoy]
+            close_ses = df["Close"][mask_hoy]
+        else:
+            tp_ses, vol_ses, close_ses = tp.tail(26), vol.tail(26), df["Close"].tail(26)
+    else:
+        tp_ses, vol_ses, close_ses = tp.tail(26), vol.tail(26), df["Close"].tail(26)
+
+    cum_vol = vol_ses.cumsum().replace(0.0, np.nan)
+    vwap_serie = ((tp_ses * vol_ses).cumsum() / cum_vol).bfill()
+    vwap_actual = _safe_float(vwap_serie.iloc[-1], _safe_float(df["Close"].iloc[-1]))
+
+    dist_pct = ((close_ses - vwap_serie) / vwap_serie.replace(0.0, np.nan)) * 100.0
+    dist_pct = dist_pct.fillna(0.0)
+    if len(dist_pct) >= 4:
+        media = _safe_float(dist_pct.mean(), 0.0)
+        desv = _safe_float(dist_pct.std(ddof=0), 0.0)
+        zscore = ( _safe_float(dist_pct.iloc[-1]) - media ) / desv if desv > 1e-5 else _safe_float(dist_pct.iloc[-1])
+    else:
+        zscore = _safe_float(dist_pct.iloc[-1], 0.0)
+
+    return vwap_actual, _safe_float(zscore, 0.0)
+
+
+def calcular_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, periodo: int = 20) -> float:
+    """Chaikin Money Flow CMF(20) — mide acumulación/distribución institucional."""
+    rango = (high - low).replace(0.0, np.nan)
+    mf_mult = (((close - low) - (high - close)) / rango).fillna(0.0)
+    mf_vol = mf_mult * volume.clip(lower=0.0)
+    vol_sum = volume.clip(lower=0.0).rolling(window=periodo, min_periods=max(5, periodo // 2)).sum().replace(0.0, np.nan)
+    cmf = (mf_vol.rolling(window=periodo, min_periods=max(5, periodo // 2)).sum() / vol_sum).fillna(0.0)
+    return _safe_float(cmf.iloc[-1], 0.0)
+
+
+# ==============================================================================
+# 3. GESTOR PRINCIPAL DE DATOS E INDICADORES
+# ==============================================================================
+
 class GestorIndicadores:
-    HISTORIAL_PATH = Path(__file__).resolve().parent / "historial_indicadores.json"
+    """
+    Coordina la descarga por lotes de precios/velas, enriquecimiento asíncrono de P/E y fundamentales,
+    cálculo de los 13 indicadores y filtrado de oportunidades de alto potencial/certeza.
+    """
 
     def __init__(
         self,
-        empresas: Optional[List[str]] = None,
-        gestor_noticias: Optional[GestorInfoMarket] = None,
-        max_workers: int = 20,
-        timeout_http: int = 4,
-    ):
-        self.empresas = empresas if empresas is not None else list(EMPRESAS)
-        self.gestor_noticias = gestor_noticias
-        self.max_workers = max_workers
-        self.timeout_http = timeout_http
-        self.primera_ejecucion: bool = True
-        self.ciclo_actual: int = 0
+        tickers: List[str],
+        modo_operacion: str,
+        historial: GestorHistorial,
+        callback_evento_alto_potencial: Optional[Callable[[AnalisisTecnicoTicker], None]] = None,
+    ) -> None:
+        self.tickers = [t.strip().upper() for t in tickers if t.strip()]
+        self.modo_operacion = modo_operacion.strip().lower()  # "spot" o "short y long"
+        self.historial = historial
+        self.callback_evento = callback_evento_alto_potencial
 
-        # Estado de referencia (último estado REPORTADO en terminal para cada acción)
-        self.estado_referencia: Dict[str, Dict[str, str]] = {}
-        # Estado inmediato del ciclo anterior
-        self.estado_ciclo_previo: Dict[str, Dict[str, str]] = {}
-        # Score de confluencia del ciclo previo por símbolo
-        self.score_previo: Dict[str, float] = {}
-        # Control de cooldown por símbolo: {simbolo: (ciclo_emitido, direccion)}
-        self.ultimo_disparo_potencial: Dict[str, Tuple[int, str]] = {}
-        # Último precio visto por símbolo
-        self.ultimo_precio_por_simbolo: Dict[str, float] = {}
-        # Series base en memoria
-        self._series_memoria: Dict[str, SerieOHLCV] = {}
-        # Caché de datos fundamentales
-        self.cache_fundamentales: Dict[str, Dict[str, Optional[float]]] = {}
+        self._lock = threading.RLock()
+        self._snapshots_actuales: Dict[str, AnalisisTecnicoTicker] = {}
+        self._historial_ticker: Dict[str, List[AnalisisTecnicoTicker]] = {t: [] for t in self.tickers}
+        self._cache_fundamentales: Dict[str, Tuple[float, Dict[str, Optional[float]]]] = {}
+        self._ultimo_evento_emitido: Dict[str, Tuple[float, str]] = {}
 
-        # Historial de eventos técnicos validados por acción (para el módulo de análisis AI)
-        self.historial_eventos_por_simbolo: Dict[str, List[InstantaneaEventoTecnico]] = {}
-        # Eventos de alto potencial detectados en el último ciclo ejecutado
-        self.ultimos_eventos_potenciales: List[InstantaneaEventoTecnico] = []
-        # Última instantánea completa por símbolo (incluso del ciclo 1) para contexto AI
-        self.ultima_instantanea_por_simbolo: Dict[str, InstantaneaEventoTecnico] = {}
+        self._detener = threading.Event()
+        self._hilo_ciclo: Optional[threading.Thread] = None
+        self._hilo_fundamentales: Optional[threading.Thread] = None
 
-        self._session = requests.Session()
-        self._session.headers.update(
-            {
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/125.0.0.0 Safari/537.36"
-                ),
-                "Accept": "application/json, text/plain, */*",
-                "Cache-Control": "no-cache, no-store, must-revalidate",
-                "Pragma": "no-cache",
-                "Expires": "0",
-            }
-        )
+    # ------------------------------------------------------------------
+    # 1. CACHÉ ASÍNCRONO DE FUNDAMENTALES (P/E, CAP. MERCADO, 52W, BETA)
+    # ------------------------------------------------------------------
 
-    def limpiar_historial(self) -> None:
-        """
-        Auto-gestión de historial: elimina datos previos en disco y reinicia memoria desde cero.
-        """
-        self.estado_referencia.clear()
-        self.estado_ciclo_previo.clear()
-        self.score_previo.clear()
-        self.ultimo_disparo_potencial.clear()
-        self.ultimo_precio_por_simbolo.clear()
-        self._series_memoria.clear()
-        self.cache_fundamentales.clear()
-        self.historial_eventos_por_simbolo.clear()
-        self.ultimos_eventos_potenciales.clear()
-        self.ultima_instantanea_por_simbolo.clear()
-        self.primera_ejecucion = True
-        self.ciclo_actual = 0
+    def _obtener_fundamentales_cacheados(self, ticker: str) -> Dict[str, Optional[float]]:
+        """Devuelve fundamentales desde memoria (refrescados en segundo plano cada 30 min)."""
+        with self._lock:
+            entrada = self._cache_fundamentales.get(ticker)
+            if entrada is not None:
+                return entrada[1]
+        return {
+            "pe_ratio": None,
+            "pe_forward": None,
+            "cap_mercado_b": None,
+            "max_52s": None,
+            "min_52s": None,
+            "beta": None,
+        }
 
-        if self.HISTORIAL_PATH.exists():
+    def _refrescar_fundamentales_worker(self) -> None:
+        """Enriquece P/E, Market Cap y Beta en paralelo sin bloquear jamás el motor de velas."""
+        def _consultar_uno(tk_usr: str) -> Tuple[str, Dict[str, Optional[float]]]:
             try:
-                self.HISTORIAL_PATH.unlink()
-            except OSError:
-                pass
-
-    def _guardar_historial_disco(self) -> None:
-        try:
-            datos = {
-                "timestamp": dt.datetime.now().astimezone().isoformat(),
-                "ciclo_actual": self.ciclo_actual,
-                "estado_referencia": self.estado_referencia,
-            }
-            self.HISTORIAL_PATH.write_text(
-                json.dumps(datos, ensure_ascii=False, indent=2), encoding="utf-8"
-            )
-        except OSError:
-            pass
-
-    # -----------------------------------------------------------------
-    # DESCARGA DE DATOS OHLCV EN TIEMPO REAL (CON HORARIO EXTENDIDO)
-    # -----------------------------------------------------------------
-    def _fetch_yahoo_chart(self, simbolo: str, cb: int) -> Optional[SerieOHLCV]:
-        urls = [
-            f"https://query1.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(simbolo)}"
-            f"?range=2d&interval=2m&includePrePost=true&_={cb}",
-            f"https://query2.finance.yahoo.com/v8/finance/chart/{urllib.parse.quote(simbolo)}"
-            f"?range=5d&interval=5m&includePrePost=true&_={cb}",
-        ]
-        for url in urls:
-            try:
-                resp = self._session.get(url, timeout=self.timeout_http)
-                if resp.status_code != 200:
-                    continue
-                data = resp.json()
-                result = (data.get("chart") or {}).get("result")
-                if not result:
-                    continue
-                item = result[0]
-                meta = item.get("meta") or {}
-
-                high_52 = meta.get("fiftyTwoWeekHigh")
-                low_52 = meta.get("fiftyTwoWeekLow")
-                precio_vivo = (
-                    meta.get("postMarketPrice")
-                    or meta.get("preMarketPrice")
-                    or meta.get("regularMarketPrice")
-                )
-                if high_52 and low_52 and precio_vivo and high_52 > low_52:
-                    pos_52s = max(
-                        0.0,
-                        min(
-                            100.0,
-                            ((float(precio_vivo) - float(low_52)) / (float(high_52) - float(low_52)))
-                            * 100.0,
-                        ),
-                    )
-                    self.cache_fundamentales.setdefault(
-                        simbolo,
-                        {
-                            "pe_trailing": None,
-                            "pe_forward": None,
-                            "beta": None,
-                            "pos_52s": pos_52s,
-                        },
-                    )["pos_52s"] = pos_52s
-
-                timestamps = item.get("timestamp") or []
-                quote_list = ((item.get("indicators") or {}).get("quote")) or []
-                if not timestamps or not quote_list:
-                    continue
-                q = quote_list[0]
-                opens_raw = q.get("open") or []
-                highs_raw = q.get("high") or []
-                lows_raw = q.get("low") or []
-                closes_raw = q.get("close") or []
-                vols_raw = q.get("volume") or []
-
-                ts_clean: List[int] = []
-                o_clean: List[float] = []
-                h_clean: List[float] = []
-                l_clean: List[float] = []
-                c_clean: List[float] = []
-                v_clean: List[float] = []
-
-                for t, o, h, l, c, v in zip(
-                    timestamps, opens_raw, highs_raw, lows_raw, closes_raw, vols_raw
-                ):
-                    if c is None or h is None or l is None:
-                        continue
-                    ts_clean.append(int(t))
-                    c_f = float(c)
-                    o_clean.append(float(o) if o is not None else c_f)
-                    h_clean.append(float(h))
-                    l_clean.append(float(l))
-                    c_clean.append(c_f)
-                    v_clean.append(float(v) if v is not None else 0.0)
-
-                if len(c_clean) >= 25:
-                    if precio_vivo is not None:
-                        p_vivo_f = float(precio_vivo)
-                        if p_vivo_f > 0:
-                            c_clean[-1] = p_vivo_f
-                            h_clean[-1] = max(h_clean[-1], p_vivo_f)
-                            l_clean[-1] = min(l_clean[-1], p_vivo_f)
-
-                    return SerieOHLCV(
-                        timestamps=ts_clean[-120:],
-                        opens=o_clean[-120:],
-                        highs=h_clean[-120:],
-                        lows=l_clean[-120:],
-                        closes=c_clean[-120:],
-                        volumes=v_clean[-120:],
-                    )
+                sym = simbolo_yfinance(tk_usr)
+                info = yf.Ticker(sym).info or {}
+                pe = info.get("trailingPE")
+                fpe = info.get("forwardPE")
+                mcap = info.get("marketCap")
+                hi52 = info.get("fiftyTwoWeekHigh")
+                lo52 = info.get("fiftyTwoWeekLow")
+                beta = info.get("beta")
+                return tk_usr, {
+                    "pe_ratio": round(float(pe), 2) if pe is not None else None,
+                    "pe_forward": round(float(fpe), 2) if fpe is not None else None,
+                    "cap_mercado_b": round(float(mcap) / 1e9, 2) if mcap is not None else None,
+                    "max_52s": round(float(hi52), 2) if hi52 is not None else None,
+                    "min_52s": round(float(lo52), 2) if lo52 is not None else None,
+                    "beta": round(float(beta), 2) if beta is not None else None,
+                }
             except Exception:
-                pass
-        return None
+                return tk_usr, {
+                    "pe_ratio": None,
+                    "pe_forward": None,
+                    "cap_mercado_b": None,
+                    "max_52s": None,
+                    "min_52s": None,
+                    "beta": None,
+                }
 
-    def _aplicar_micro_dinamica_mercado(
-        self, simbolo: str, serie: SerieOHLCV
-    ) -> SerieOHLCV:
-        if self.primera_ejecucion:
-            self._series_memoria[simbolo] = serie.clonar()
-            return serie
+        while not self._detener.is_set():
+            ahora = time.time()
+            pendientes = []
+            with self._lock:
+                for t in self.tickers:
+                    cache = self._cache_fundamentales.get(t)
+                    if cache is None or (ahora - cache[0]) > 1800:
+                        pendientes.append(t)
 
-        mem = self._series_memoria.get(simbolo)
-        if mem is None:
-            self._series_memoria[simbolo] = serie.clonar()
-            return serie
-
-        if abs(serie.closes[-1] - mem.closes[-1]) > 1e-5:
-            self._series_memoria[simbolo] = serie.clonar()
-            return serie
-
-        nueva = mem.clonar()
-        atr_vals = calcular_atr_lista(nueva, periodo=14)
-        atr_actual = atr_vals[-1] if atr_vals else nueva.closes[-1] * 0.005
-
-        hash_sym = int(
-            hashlib.sha256(f"{simbolo}:{self.ciclo_actual}:{int(time.time() // 8)}".encode()).hexdigest()[:12],
-            16,
-        )
-        rng = random.Random(hash_sym)
-
-        # Mantener continuidad suave con la tendencia corta para no introducir ruido artificial
-        pendiente_corta = (nueva.closes[-1] - nueva.closes[-5]) / 5.0 if len(nueva) >= 6 else 0.0
-        sesgo = max(-0.25 * atr_actual, min(0.25 * atr_actual, pendiente_corta * 0.35))
-        es_impulso = (hash_sym % 23) == 0
-        escala = 0.55 if es_impulso else 0.14
-        delta = sesgo + rng.gauss(0.0, atr_actual * escala)
-
-        prev_c = nueva.closes[-1]
-        nuevo_c = max(0.5, prev_c + delta)
-        spread = abs(rng.gauss(0.0, atr_actual * 0.18))
-        nuevo_h = max(prev_c, nuevo_c) + spread
-        nuevo_l = max(0.2, min(prev_c, nuevo_c) - spread)
-
-        vol_medio = _media(nueva.volumes[-20:]) or 250_000.0
-        mult_vol = rng.uniform(1.30, 2.20) if es_impulso else rng.uniform(0.85, 1.25)
-        nuevo_v = max(1000.0, vol_medio * mult_vol)
-
-        nueva.timestamps.append(int(time.time()))
-        nueva.opens.append(prev_c)
-        nueva.highs.append(nuevo_h)
-        nueva.lows.append(nuevo_l)
-        nueva.closes.append(nuevo_c)
-        nueva.volumes.append(nuevo_v)
-
-        if len(nueva.closes) > 120:
-            nueva.timestamps = nueva.timestamps[-120:]
-            nueva.opens = nueva.opens[-120:]
-            nueva.highs = nueva.highs[-120:]
-            nueva.lows = nueva.lows[-120:]
-            nueva.closes = nueva.closes[-120:]
-            nueva.volumes = nueva.volumes[-120:]
-
-        self._series_memoria[simbolo] = nueva
-        return nueva
-
-    def _obtener_datos_mercado(self) -> Dict[str, SerieOHLCV]:
-        datos_por_simbolo: Dict[str, SerieOHLCV] = {}
-        cb = int(time.time() * 1000)
-
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
-            futuros = {
-                executor.submit(self._fetch_yahoo_chart, sym, cb): sym
-                for sym in self.empresas
-            }
-            for fut in as_completed(futuros):
-                sym = futuros[fut]
+            # Procesar en bloques moderados de 12 para no saturar Yahoo
+            for i in range(0, len(pendientes), 12):
+                if self._detener.is_set():
+                    return
+                sub = pendientes[i : i + 12]
+                pool = ThreadPoolExecutor(max_workers=6)
                 try:
-                    serie = fut.result()
-                    if serie is not None and len(serie) >= 20:
-                        datos_por_simbolo[sym] = serie
+                    futuros_f = [pool.submit(_consultar_uno, tk_s) for tk_s in sub]
+                    for fut_f in futuros_f:
+                        if self._detener.is_set():
+                            break
+                        tk_res, datos_f = fut_f.result()
+                        with self._lock:
+                            self._cache_fundamentales[tk_res] = (time.time(), datos_f)
+                finally:
+                    pool.shutdown(wait=not self._detener.is_set(), cancel_futures=True)
+                self._detener.wait(timeout=1.0)
+
+            self._detener.wait(timeout=60.0)
+
+    # ------------------------------------------------------------------
+    # 2. EXTRACCIÓN SEGURA DE DATAFRAME POR TICKER DESDE LOTE YFINANCE
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extraer_sub_df(df_lote: pd.DataFrame, simbolo_yf: str, total_simbolos: int) -> Optional[pd.DataFrame]:
+        """Extrae limpiamente las columnas Open, High, Low, Close, Volume de `yf.download`."""
+        if df_lote is None or df_lote.empty:
+            return None
+        try:
+            if isinstance(df_lote.columns, pd.MultiIndex):
+                niveles_0 = set(df_lote.columns.get_level_values(0))
+                niveles_1 = set(df_lote.columns.get_level_values(1))
+                if simbolo_yf in niveles_0:
+                    sub = df_lote[simbolo_yf].copy()
+                elif simbolo_yf in niveles_1:
+                    sub = df_lote.xs(simbolo_yf, axis=1, level=1).copy()
+                else:
+                    return None
+            else:
+                if total_simbolos == 1:
+                    sub = df_lote.copy()
+                else:
+                    return None
+
+            cols_req = ["Open", "High", "Low", "Close", "Volume"]
+            if not all(c in sub.columns for c in cols_req):
+                return None
+            sub = sub[cols_req].dropna(subset=["High", "Low", "Close"])
+            if len(sub) < 22:
+                return None
+            return sub
+        except Exception:
+            return None
+
+    # ------------------------------------------------------------------
+    # 3. EVALUACIÓN COMPLETA DE LOS 13 INDICADORES Y REGLAS DE ALARMA
+    # ------------------------------------------------------------------
+
+    def _evaluar_ticker_dataframe(
+        self,
+        ticker: str,
+        df_intra: pd.DataFrame,
+        df_diario: Optional[pd.DataFrame],
+    ) -> AnalisisTecnicoTicker:
+        """Calcula datos financieros, niveles S/R, los 13 indicadores y el score de certeza."""
+        high = df_intra["High"].astype(float)
+        low = df_intra["Low"].astype(float)
+        close = df_intra["Close"].astype(float)
+        volume = df_intra["Volume"].fillna(0.0).astype(float)
+
+        precio_actual = _safe_float(close.iloc[-1])
+        atr_serie = calcular_atr(high, low, close, periodo=14)
+        atr_14 = max(_safe_float(atr_serie.iloc[-1], precio_actual * 0.01), 1e-4)
+
+        # Cambio porcentual diario y niveles estructurales Soporte/Resistencia (Pivotes + Fractales)
+        if df_diario is not None and len(df_diario) >= 5:
+            d_high = df_diario["High"].astype(float)
+            d_low = df_diario["Low"].astype(float)
+            d_close = df_diario["Close"].astype(float)
+            cierre_previo = _safe_float(d_close.iloc[-2], _safe_float(close.iloc[0], precio_actual))
+            cambio_pct = ((precio_actual - cierre_previo) / max(cierre_previo, 1e-6)) * 100.0
+
+            # Pivote clásico de la sesión previa combinado con swing reciente de 20 sesiones
+            h_prev = _safe_float(d_high.iloc[-2], _safe_float(high.max()))
+            l_prev = _safe_float(d_low.iloc[-2], _safe_float(low.min()))
+            pivote = (h_prev + l_prev + cierre_previo) / 3.0
+            r1_piv = 2.0 * pivote - l_prev
+            s1_piv = 2.0 * pivote - h_prev
+            swing_hi = _safe_float(d_high.tail(20).max(), r1_piv)
+            swing_lo = _safe_float(d_low.tail(20).min(), s1_piv)
+
+            soporte_1 = round(min(precio_actual * 0.995, max(s1_piv, swing_lo)), 2)
+            soporte_2 = round(min(soporte_1 * 0.985, swing_lo), 2)
+            resistencia_1 = round(max(precio_actual * 1.005, min(r1_piv, swing_hi)), 2)
+            resistencia_2 = round(max(resistencia_1 * 1.015, swing_hi), 2)
+            max_52_calc = round(_safe_float(d_high.max(), precio_actual), 2)
+            min_52_calc = round(_safe_float(d_low.min(), precio_actual), 2)
+        else:
+            cierre_ini = _safe_float(close.iloc[-min(len(close), 26)], precio_actual)
+            cambio_pct = ((precio_actual - cierre_ini) / max(cierre_ini, 1e-6)) * 100.0
+            soporte_1 = round(_safe_float(low.tail(30).min(), precio_actual - 1.5 * atr_14), 2)
+            soporte_2 = round(soporte_1 - 1.5 * atr_14, 2)
+            resistencia_1 = round(_safe_float(high.tail(30).max(), precio_actual + 1.5 * atr_14), 2)
+            resistencia_2 = round(resistencia_1 + 1.5 * atr_14, 2)
+            max_52_calc = None
+            min_52_calc = None
+
+        vwap_sesion, vwap_z = calcular_vwap_sesion_zscore(df_intra)
+        vol_barra = _safe_float(volume.iloc[-1], 0.0)
+        vol_prom_20 = max(_safe_float(volume.tail(20).mean(), 1.0), 1.0)
+
+        fund = self._obtener_fundamentales_cacheados(ticker)
+        datos_fin = DatosFinancieros(
+            ticker=ticker,
+            precio_actual=round(precio_actual, 2),
+            cambio_diario_pct=round(cambio_pct, 2),
+            pe_ratio=fund["pe_ratio"],
+            pe_forward=fund["pe_forward"],
+            soporte_1=soporte_1,
+            soporte_2=soporte_2,
+            resistencia_1=resistencia_1,
+            resistencia_2=resistencia_2,
+            vwap_sesion=round(vwap_sesion, 2),
+            atr_14=round(atr_14, 3),
+            volumen_barra=round(vol_barra, 0),
+            volumen_promedio_20=round(vol_prom_20, 0),
+            cap_mercado_b=fund["cap_mercado_b"],
+            max_52_semanas=fund["max_52s"] or max_52_calc,
+            min_52_semanas=fund["min_52s"] or min_52_calc,
+            beta=fund["beta"],
+        )
+
+        indicadores: List[ResultadoIndicador] = []
+
+        # --- 1. Oscilador (contrarian) | RSI(14) | cortes 20/35/65/80 ---
+        rsi_val = calcular_rsi(close, 14)
+        if rsi_val <= 20.0:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif rsi_val <= 35.0:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif rsi_val < 65.0:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif rsi_val < 80.0:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Oscilador (contrarian)", "RSI(14)", round(rsi_val, 2),
+            f"{rsi_val:.2f} [20/35/65/80]", ev, pts, alm,
+        ))
+
+        # --- 2. Oscilador (contrarian) | Stoch(14,3,3) | cortes 10/20/80/90 ---
+        stoch_k, stoch_d = calcular_stoch(high, low, close, 14, 3, 3)
+        if stoch_k <= 10.0:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif stoch_k <= 20.0:
+            ev, pts, alm = "COMPRA", 1.0, "COMPRA" if stoch_k > stoch_d else None
+        elif stoch_k < 80.0:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif stoch_k < 90.0:
+            ev, pts, alm = "VENTA", -1.0, "VENTA" if stoch_k < stoch_d else None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Oscilador (contrarian)", "Stoch(14,3,3)", round(stoch_k, 2),
+            f"%K={stoch_k:.1f} %D={stoch_d:.1f} [10/20/80/90]", ev, pts, alm,
+        ))
+
+        # --- 3. Oscilador (contrarian) | Bollinger %B(20,2) | cortes 0/0.2/0.8/1 ---
+        bb_pct_b = calcular_bollinger_pct_b(close, 20, 2.0)
+        if bb_pct_b <= 0.0:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif bb_pct_b <= 0.2:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif bb_pct_b < 0.8:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif bb_pct_b < 1.0:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Oscilador (contrarian)", "Bollinger %B(20,2)", round(bb_pct_b, 3),
+            f"{bb_pct_b:.3f} [0/0.2/0.8/1]", ev, pts, alm,
+        ))
+
+        # --- 4. Oscilador (contrarian) | MFI(14), con volumen | cortes 15/30/70/85 ---
+        mfi_val = calcular_mfi(high, low, close, volume, 14)
+        if mfi_val <= 15.0:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif mfi_val <= 30.0:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif mfi_val < 70.0:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif mfi_val < 85.0:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Oscilador (contrarian)", "MFI(14) vol", round(mfi_val, 2),
+            f"{mfi_val:.2f} [15/30/70/85]", ev, pts, alm,
+        ))
+
+        # --- 5. Tendencia | EMA 9/21 | spread dividido por ATR ---
+        ema9 = close.ewm(span=9, adjust=False).mean()
+        ema21 = close.ewm(span=21, adjust=False).mean()
+        ema_spread_atr = _safe_float((ema9.iloc[-1] - ema21.iloc[-1]) / atr_14, 0.0)
+        cruce_ema_alcista = bool(ema9.iloc[-1] > ema21.iloc[-1] and ema9.iloc[-2] <= ema21.iloc[-2])
+        cruce_ema_bajista = bool(ema9.iloc[-1] < ema21.iloc[-1] and ema9.iloc[-2] >= ema21.iloc[-2])
+        if ema_spread_atr >= 1.0 or cruce_ema_alcista:
+            ev = "COMPRA FUERTE" if ema_spread_atr >= 1.0 else "COMPRA"
+            pts = 2.0 if ema_spread_atr >= 1.0 else 1.25
+            alm = "COMPRA"
+        elif ema_spread_atr >= 0.25:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif ema_spread_atr > -0.25:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif ema_spread_atr > -1.0 and not cruce_ema_bajista:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev = "VENTA FUERTE" if ema_spread_atr <= -1.0 else "VENTA"
+            pts = -2.0 if ema_spread_atr <= -1.0 else -1.25
+            alm = "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Tendencia", "EMA 9/21 / ATR", round(ema_spread_atr, 3),
+            f"{ema_spread_atr:+.3f} ATR", ev, pts, alm,
+        ))
+
+        # --- 6. Tendencia | MACD histograma | dividido por ATR ---
+        ema12 = close.ewm(span=12, adjust=False).mean()
+        ema26 = close.ewm(span=26, adjust=False).mean()
+        macd_line = ema12 - ema26
+        macd_sig = macd_line.ewm(span=9, adjust=False).mean()
+        macd_hist = macd_line - macd_sig
+        macd_atr = _safe_float(macd_hist.iloc[-1] / atr_14, 0.0)
+        if macd_atr >= 0.35:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif macd_atr >= 0.08:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif macd_atr > -0.08:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif macd_atr > -0.35:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Tendencia", "MACD Hist / ATR", round(macd_atr, 3),
+            f"{macd_atr:+.3f} ATR", ev, pts, alm,
+        ))
+
+        # --- 7. Tendencia | VWAP de sesión | z-score de la distancia % ---
+        if vwap_z >= 1.5:
+            ev, pts, alm = "COMPRA FUERTE", 1.8, "COMPRA"
+        elif vwap_z >= 0.45:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif vwap_z > -0.45:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif vwap_z > -1.5:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -1.8, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Tendencia", "VWAP Sesión Z-Score", round(vwap_z, 3),
+            f"Z={vwap_z:+.2f} (VWAP=${vwap_sesion:.2f})", ev, pts, alm,
+        ))
+
+        # --- 8. Tendencia | ADX/DI | DI+ − DI−, vale 0 si ADX < 20 ---
+        adx_val, di_pos, di_neg, spread_di = calcular_adx_di(high, low, close, 14)
+        if spread_di >= 15.0:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif spread_di >= 5.0:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif spread_di > -5.0:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif spread_di > -15.0:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        etiqueta_adx = f"{spread_di:+.2f} (ADX={adx_val:.1f})"
+        indicadores.append(ResultadoIndicador(
+            "Tendencia", "ADX/DI (DI+-DI-)", round(spread_di, 2),
+            etiqueta_adx, ev, pts, alm,
+        ))
+
+        # --- 9. Supertrend(10,2.5)/ATR ---
+        st_atr, st_dir, st_flip = calcular_supertrend_norm(high, low, close, atr_14, 10, 2.5)
+        if st_dir == 1 and (st_flip or st_atr >= 1.2):
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif st_dir == 1:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif st_dir == -1 and (st_flip or st_atr <= -1.2):
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        else:
+            ev, pts, alm = "VENTA", -1.0, None
+        indicadores.append(ResultadoIndicador(
+            "Tendencia", "Supertrend(10,2.5)/ATR", round(st_atr, 3),
+            f"{st_atr:+.3f} ({'ALCISTA' if st_dir == 1 else 'BAJISTA'})", ev, pts, alm,
+        ))
+
+        # --- 10. CMF(20) Flujo Inst. ---
+        cmf_val = calcular_cmf(high, low, close, volume, 20)
+        if cmf_val >= 0.20:
+            ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
+        elif cmf_val >= 0.06:
+            ev, pts, alm = "COMPRA", 1.0, None
+        elif cmf_val > -0.06:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif cmf_val > -0.20:
+            ev, pts, alm = "VENTA", -1.0, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Flujo Inst.", "CMF(20) Flujo Inst.", round(cmf_val, 3),
+            f"{cmf_val:+.3f}", ev, pts, alm,
+        ))
+
+        # --- 11. Volumen Real | RVOL(20) Impulso Direccional ---
+        rvol = vol_barra / vol_prom_20
+        vela_alcista = precio_actual >= _safe_float(df_intra["Open"].iloc[-1], precio_actual)
+        if rvol >= 1.8 and vela_alcista:
+            ev, pts, alm = "COMPRA FUERTE", 1.8, "COMPRA"
+        elif rvol >= 1.25 and vela_alcista:
+            ev, pts, alm = "COMPRA", 0.9, None
+        elif rvol >= 1.8 and not vela_alcista:
+            ev, pts, alm = "VENTA FUERTE", -1.8, "VENTA"
+        elif rvol >= 1.25 and not vela_alcista:
+            ev, pts, alm = "VENTA", -0.9, None
+        else:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        indicadores.append(ResultadoIndicador(
+            "Volumen Real", "RVOL(20) Real", round(rvol, 2),
+            f"{rvol:.2f}x prom ({'comprador' if vela_alcista else 'vendedor'})", ev, pts, alm,
+        ))
+
+        # --- 12. Volumen Real | OBV Z-Score(20) ---
+        signo_cierre = np.sign(close.diff().fillna(0.0))
+        obv = (signo_cierre * volume).cumsum()
+        obv_win = obv.tail(20)
+        obv_std = _safe_float(obv_win.std(ddof=0), 0.0)
+        obv_z = (_safe_float(obv.iloc[-1]) - _safe_float(obv_win.mean())) / obv_std if obv_std > 1e-5 else 0.0
+        if obv_z >= 1.6:
+            ev, pts, alm = "COMPRA FUERTE", 1.5, "COMPRA"
+        elif obv_z >= 0.6:
+            ev, pts, alm = "COMPRA", 0.8, None
+        elif obv_z > -0.6:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+        elif obv_z > -1.6:
+            ev, pts, alm = "VENTA", -0.8, None
+        else:
+            ev, pts, alm = "VENTA FUERTE", -1.5, "VENTA"
+        indicadores.append(ResultadoIndicador(
+            "Volumen Real", "OBV Z-Score(20)", round(obv_z, 2),
+            f"Z={obv_z:+.2f}", ev, pts, alm,
+        ))
+
+        # --- 13. Estructural | Rango Soporte/Resistencia & BOS ---
+        rango_sr = max(resistencia_1 - soporte_1, atr_14)
+        pos_sr = (precio_actual - soporte_1) / rango_sr
+        if precio_actual > resistencia_1 and rvol >= 1.2:
+            ev, pts, alm = "COMPRA FUERTE", 1.8, "COMPRA"
+            txt_sr = f"BOS Alcista > R1(${resistencia_1:.2f})"
+        elif pos_sr <= 0.18:
+            ev, pts, alm = "COMPRA", 1.1, "COMPRA"
+            txt_sr = f"Zona Soporte S1(${soporte_1:.2f})"
+        elif precio_actual < soporte_1 and rvol >= 1.2:
+            ev, pts, alm = "VENTA FUERTE", -1.8, "VENTA"
+            txt_sr = f"BOS Bajista < S1(${soporte_1:.2f})"
+        elif pos_sr >= 0.85:
+            ev, pts, alm = "VENTA", -1.0, None
+            txt_sr = f"Zona Resistencia R1(${resistencia_1:.2f})"
+        else:
+            ev, pts, alm = "NEUTRAL", 0.0, None
+            txt_sr = f"Rango {pos_sr*100:.0f}% [S1=${soporte_1:.2f} / R1=${resistencia_1:.2f}]"
+        indicadores.append(ResultadoIndicador(
+            "Estructural", "Estructura S/R & BOS", round(pos_sr, 2),
+            txt_sr, ev, pts, alm,
+        ))
+
+        # --- SÍNTESIS DE CONFLUENCIA, EVALUACIÓN GENERAL Y CERTEZA ---
+        alarmas_compra = [ind.nombre for ind in indicadores if ind.alarma == "COMPRA"]
+        alarmas_venta = [ind.nombre for ind in indicadores if ind.alarma == "VENTA"]
+
+        suma_puntaje = sum(ind.puntaje for ind in indicadores)
+        max_teorico = 24.0
+        indice_neto = suma_puntaje / max_teorico  # [-1.0, +1.0]
+
+        if indice_neto >= 0.30:
+            eval_general = "COMPRA FUERTE"
+            dir_potencial = "ALCISTA"
+        elif indice_neto >= 0.11:
+            eval_general = "COMPRA"
+            dir_potencial = "ALCISTA"
+        elif indice_neto <= -0.30:
+            eval_general = "VENTA FUERTE"
+            dir_potencial = "BAJISTA"
+        elif indice_neto <= -0.11:
+            eval_general = "VENTA"
+            dir_potencial = "BAJISTA"
+        else:
+            eval_general = "NEUTRAL"
+            dir_potencial = "NEUTRAL"
+
+        # Nivel de certeza y potencial: combina magnitud del consenso + número de alarmas alineadas + volumen institucional
+        n_alarmas_favor = len(alarmas_compra) if dir_potencial == "ALCISTA" else (len(alarmas_venta) if dir_potencial == "BAJISTA" else 0)
+        n_alarmas_contra = len(alarmas_venta) if dir_potencial == "ALCISTA" else (len(alarmas_compra) if dir_potencial == "BAJISTA" else 0)
+        respaldo_institucional = 8.0 if ((dir_potencial == "ALCISTA" and cmf_val > 0.05) or (dir_potencial == "BAJISTA" and cmf_val < -0.05)) else 0.0
+        respaldo_rvol = min(10.0, max(0.0, (rvol - 1.0) * 8.0))
+
+        potencial_score = min(
+            100.0,
+            abs(indice_neto) * 115.0 + n_alarmas_favor * 9.5 + respaldo_institucional + respaldo_rvol - n_alarmas_contra * 6.0,
+        )
+        potencial_score = round(max(0.0, potencial_score), 1)
+
+        certeza_pct = min(
+            98.0,
+            42.0 + abs(indice_neto) * 65.0 + n_alarmas_favor * 6.5 + respaldo_institucional * 0.8 - n_alarmas_contra * 8.0,
+        ) if dir_potencial != "NEUTRAL" else 30.0
+        certeza_pct = round(max(15.0, certeza_pct), 1)
+
+        # Filtro estricto de evento de alto potencial según modo ("spot" vs "short y long")
+        operacion_compatible = (
+            dir_potencial == "ALCISTA"
+            or (dir_potencial == "BAJISTA" and "short" in self.modo_operacion)
+        )
+        es_alto_potencial = bool(
+            operacion_compatible
+            and potencial_score >= UMBRAL_POTENCIAL_DATOS_TERMINAL
+            and certeza_pct >= UMBRAL_CERTEZA_EVENTO_TECNICO
+            and n_alarmas_favor >= 2
+        )
+
+        motivo = ""
+        if es_alto_potencial:
+            lista_alm = ", ".join((alarmas_compra if dir_potencial == "ALCISTA" else alarmas_venta)[:4])
+            motivo = f"{eval_general} ({certeza_pct:.0f}% certeza) | Alarmas: {lista_alm}"
+
+        return AnalisisTecnicoTicker(
+            ticker=ticker,
+            epoch=time.time(),
+            fecha_hora_ampm=formatear_fecha_hora_ampm(),
+            datos_financieros=datos_fin,
+            indicadores=indicadores,
+            evaluacion_general=eval_general,
+            direccion_potencial=dir_potencial,
+            potencial_score=potencial_score,
+            certeza_pct=certeza_pct,
+            alarmas_compra=alarmas_compra,
+            alarmas_venta=alarmas_venta,
+            es_evento_alto_potencial=es_alto_potencial,
+            motivo_evento=motivo,
+        )
+
+    # ------------------------------------------------------------------
+    # 4. EJECUCIÓN VECTORIZADA POR LOTES Y CICLO CONTINUO
+    # ------------------------------------------------------------------
+
+    def actualizar_todos_los_tickers(self) -> Dict[str, AnalisisTecnicoTicker]:
+        """
+        Descarga velas intradía (15m, 5d) y diarias (1d, 3mo) en lotes vectorizados rápidos,
+        actualiza los indicadores de toda la lista y emite eventos de alto potencial a `/datos`.
+        """
+        mapa_yf = {t: simbolo_yfinance(t) for t in self.tickers}
+        simbolos_yf = list(dict.fromkeys(mapa_yf.values()))
+
+        # Cachear descarga diaria cada 15 min para máxima velocidad
+        ahora = time.time()
+        if not hasattr(self, "_cache_df_diario") or (ahora - getattr(self, "_ts_df_diario", 0.0)) > 900:
+            try:
+                self._cache_df_diario = yf.download(
+                    simbolos_yf,
+                    period="3mo",
+                    interval="1d",
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    auto_adjust=True,
+                )
+                self._ts_df_diario = ahora
+            except Exception:
+                self._cache_df_diario = pd.DataFrame()
+
+        # Descarga intradía fresca en sub-lotes de 35 símbolos para máxima estabilidad de red
+        resultados_ciclo: Dict[str, AnalisisTecnicoTicker] = {}
+        paso = 35
+        for idx in range(0, len(self.tickers), paso):
+            sub_tickers = self.tickers[idx : idx + paso]
+            sub_yf = [mapa_yf[t] for t in sub_tickers]
+            try:
+                df_intra_lote = yf.download(
+                    sub_yf,
+                    period="5d",
+                    interval="15m",
+                    group_by="ticker",
+                    threads=True,
+                    progress=False,
+                    auto_adjust=True,
+                )
+            except Exception:
+                continue
+
+            for tk in sub_tickers:
+                sym = mapa_yf[tk]
+                df_tk_intra = self._extraer_sub_df(df_intra_lote, sym, len(sub_yf))
+                if df_tk_intra is None:
+                    continue
+                df_tk_diario = self._extraer_sub_df(
+                    getattr(self, "_cache_df_diario", pd.DataFrame()),
+                    sym,
+                    len(simbolos_yf),
+                )
+                try:
+                    analisis = self._evaluar_ticker_dataframe(tk, df_tk_intra, df_tk_diario)
+                    resultados_ciclo[tk] = analisis
+                except Exception:
+                    continue
+
+        # Guardar en memoria e historial reciente para ventana de contexto de IA
+        eventos_a_notificar: List[AnalisisTecnicoTicker] = []
+        with self._lock:
+            for tk, an in resultados_ciclo.items():
+                self._snapshots_actuales[tk] = an
+                hist_lista = self._historial_ticker.setdefault(tk, [])
+                hist_lista.append(an)
+                if len(hist_lista) > 6:
+                    del hist_lista[:-6]
+
+                if an.es_evento_alto_potencial:
+                    prev = self._ultimo_evento_emitido.get(tk)
+                    # Evitar repetir el mismo evento en `/datos` cada 35s si no cambió dirección o pasaron 4 min
+                    if prev is None or prev[1] != an.evaluacion_general or (ahora - prev[0]) >= 240:
+                        self._ultimo_evento_emitido[tk] = (ahora, an.evaluacion_general)
+                        eventos_a_notificar.append(an)
+
+        for ev_tk in eventos_a_notificar:
+            self.historial.registrar_evento_datos_stream(ev_tk.to_dict())
+            if self.callback_evento is not None:
+                try:
+                    self.callback_evento(ev_tk)
                 except Exception:
                     pass
 
-        for sym in self.empresas:
-            if sym not in datos_por_simbolo:
-                if sym not in self._series_memoria:
-                    self._series_memoria[sym] = self._generar_serie_respaldo(sym)
-                base_serie = self._series_memoria[sym]
-            else:
-                base_serie = datos_por_simbolo[sym]
+        return resultados_ciclo
 
-            datos_por_simbolo[sym] = self._aplicar_micro_dinamica_mercado(sym, base_serie)
+    def consultar_ticker_puntual(self, ticker: str) -> Optional[AnalisisTecnicoTicker]:
+        """Obtiene el snapshot más reciente o fuerza cálculo puntual inmediato para una noticia urgente."""
+        tk = ticker.strip().upper()
+        with self._lock:
+            existente = self._snapshots_actuales.get(tk)
+            if existente is not None and (time.time() - existente.epoch) < 45.0:
+                return existente
 
-        return datos_por_simbolo
-
-    @staticmethod
-    def _generar_serie_respaldo(simbolo: str, n_barras: int = 80) -> SerieOHLCV:
-        h_val = int(hashlib.sha256(f"base:{simbolo}".encode()).hexdigest()[:12], 16)
-        rng = random.Random(h_val)
-        precio_base = 25.0 + (h_val % 320) + ((h_val >> 8) % 100) / 100.0
-
-        ahora_ts = int(dt.datetime.now().timestamp())
-        timestamps: List[int] = []
-        opens: List[float] = []
-        highs: List[float] = []
-        lows: List[float] = []
-        closes: List[float] = []
-        volumes: List[float] = []
-
-        # Algunas acciones tendrán tendencia limpia y otras comportamiento errático para probar el filtro
-        es_accion_erratica = (h_val % 7) == 0
-        deriva = 0.0 if es_accion_erratica else (0.0012 if (h_val % 2 == 0) else -0.0011)
-        volatilidad = 0.019 if es_accion_erratica else 0.0065
-
-        precio = precio_base
-        for i in range(n_barras):
-            ts = ahora_ts - 120 * (n_barras - 1 - i)
-            if es_accion_erratica:
-                # Alternancia brusca ("serrucho")
-                signo_alt = 1.0 if (i % 2 == 0) else -1.0
-                ret = signo_alt * rng.uniform(0.008, 0.022)
-            else:
-                ret = rng.gauss(deriva, volatilidad)
-            open_p = precio
-            close_p = max(1.0, open_p * math.exp(ret))
-            spread = abs(rng.gauss(0.006 if es_accion_erratica else 0.002, 0.0015))
-            high_p = max(open_p, close_p) * (1.0 + spread)
-            low_p = min(open_p, close_p) * (1.0 - spread)
-            vol = float(rng.randint(120_000, 1_800_000))
-
-            timestamps.append(ts)
-            opens.append(open_p)
-            highs.append(high_p)
-            lows.append(low_p)
-            closes.append(close_p)
-            volumes.append(vol)
-            precio = close_p
-
-        return SerieOHLCV(
-            timestamps=timestamps,
-            opens=opens,
-            highs=highs,
-            lows=lows,
-            closes=closes,
-            volumes=volumes,
-        )
-
-    def _obtener_fundamentales_simbolo(
-        self, simbolo: str, serie: SerieOHLCV
-    ) -> Dict[str, Optional[float]]:
-        existente = self.cache_fundamentales.get(simbolo)
-        if existente and existente.get("pe_trailing") is not None:
+        sym = simbolo_yfinance(tk)
+        try:
+            df_intra = yf.download(sym, period="5d", interval="15m", progress=False, auto_adjust=True)
+            df_sub = self._extraer_sub_df(df_intra, sym, 1)
+            if df_sub is None:
+                return existente
+            df_diario = self._extraer_sub_df(getattr(self, "_cache_df_diario", pd.DataFrame()), sym, len(self.tickers))
+            analisis = self._evaluar_ticker_dataframe(tk, df_sub, df_diario)
+            with self._lock:
+                self._snapshots_actuales[tk] = analisis
+                hist_lista = self._historial_ticker.setdefault(tk, [])
+                hist_lista.append(analisis)
+                if len(hist_lista) > 6:
+                    del hist_lista[:-6]
+            if analisis.es_evento_alto_potencial:
+                self.historial.registrar_evento_datos_stream(analisis.to_dict())
+            return analisis
+        except Exception:
             return existente
 
-        semilla_pe = int(hashlib.sha256(f"pe:{simbolo}".encode()).hexdigest()[:8], 16)
-        high_52 = max(serie.highs) * 1.12
-        low_52 = min(serie.lows) * 0.88
-
-        pe_trailing = round(10.5 + (semilla_pe % 380) / 10.0, 1)
-        pe_forward = round(pe_trailing * 0.88, 1)
-        beta = round(0.70 + (semilla_pe % 125) / 100.0, 2)
-
-        precio_actual = serie.closes[-1]
-        pos_52s = (
-            ((precio_actual - low_52) / (high_52 - low_52)) * 100.0
-            if high_52 > low_52
-            else 50.0
-        )
-        pos_52s = max(0.0, min(100.0, pos_52s))
-
-        datos = {
-            "pe_trailing": float(pe_trailing),
-            "pe_forward": float(pe_forward),
-            "beta": float(beta),
-            "pos_52s": pos_52s,
-        }
-        self.cache_fundamentales[simbolo] = datos
-        return datos
-
-    # -----------------------------------------------------------------
-    # EVALUACIÓN DE LOS 11 INDICADORES (8 BASE + 3 DE FLUJO Y ESTABILIDAD)
-    # -----------------------------------------------------------------
-    def evaluar_indicadores_accion(self, serie: SerieOHLCV) -> List[ResultadoIndicador]:
-        closes = serie.closes
-        atr_series = calcular_atr_lista(serie, periodo=14)
-
-        # 1. RSI(14) - cortes 20/35/65/80 (contrarian)
-        val_rsi = calcular_rsi(closes, periodo=14)
-        res_rsi = clasificar_contrarian(val_rsi, 20.0, 35.0, 65.0, 80.0)
-
-        # 2. Stoch(14,3,3) - cortes 10/20/80/90 (contrarian)
-        val_stoch = calcular_stoch(serie, 14, 3, 3)
-        res_stoch = clasificar_contrarian(val_stoch, 10.0, 20.0, 80.0, 90.0)
-
-        # 3. Bollinger %B(20,2) - cortes 0/0.2/0.8/1 (contrarian)
-        val_bb = calcular_bollinger_pct_b(closes, 20, 2.0)
-        res_bb = clasificar_contrarian(val_bb, 0.0, 0.2, 0.8, 1.0)
-
-        # 4. MFI(14), con volumen - cortes 15/30/70/85 (contrarian)
-        val_mfi = calcular_mfi(serie, periodo=14)
-        res_mfi = clasificar_contrarian(val_mfi, 15.0, 30.0, 70.0, 85.0)
-
-        # 5. EMA 9/21 | spread dividido por ATR (tendencia)
-        val_ema = calcular_ema_spread_atr(closes, atr_series)
-        res_ema = clasificar_tendencia(val_ema, -1.0, -0.25, 0.25, 1.0)
-
-        # 6. MACD histograma | dividido por ATR (tendencia)
-        val_macd = calcular_macd_hist_atr(closes, atr_series)
-        res_macd = clasificar_tendencia(val_macd, -0.5, -0.15, 0.15, 0.5)
-
-        # 7. VWAP de sesión | z-score de la distancia % (tendencia)
-        val_vwap = calcular_vwap_zscore(serie, ventana_z=20)
-        res_vwap = clasificar_tendencia(val_vwap, -1.5, -0.5, 0.5, 1.5)
-
-        # 8. ADX/DI | DI+ − DI−, vale 0 si ADX < 20 (tendencia)
-        val_adx_di, _, _, _ = calcular_adx_di(serie, periodo=14)
-        res_adx_di = (
-            "neutral"
-            if val_adx_di == 0.0
-            else clasificar_tendencia(val_adx_di, -15.0, -5.0, 5.0, 15.0)
-        )
-
-        # 9. Supertrend(10, 2.5) Dist/ATR (tendencia estructural)
-        val_st = calcular_supertrend_dist_atr(serie, periodo_atr=10, multiplicador=2.5)
-        res_st = clasificar_tendencia(val_st, -1.8, -0.3, 0.3, 1.8)
-
-        # 10. CMF(20) Chaikin Money Flow (acumulación/distribución institucional)
-        val_cmf = calcular_cmf(serie, periodo=20)
-        res_cmf = clasificar_tendencia(val_cmf, -0.20, -0.05, 0.05, 0.20)
-
-        # 11. Eficiencia Direccional Kaufman ER(14) Firmado (filtro de limpieza vs ruido errático)
-        er_val = calcular_efficiency_ratio(closes, periodo=14)
-        signo_dir = 1.0 if closes[-1] >= closes[-min(len(closes), 15)] else -1.0
-        er_firmado = er_val * signo_dir if er_val >= 0.18 else 0.0
-        res_er = clasificar_tendencia(er_firmado, -0.45, -0.20, 0.20, 0.45)
-
-        return [
-            ResultadoIndicador("RSI(14)", "oscilador", val_rsi, res_rsi),
-            ResultadoIndicador("Stoch(14,3,3)", "oscilador", val_stoch, res_stoch),
-            ResultadoIndicador("Bollinger %B(20,2)", "oscilador", val_bb, res_bb),
-            ResultadoIndicador("MFI(14)", "oscilador", val_mfi, res_mfi),
-            ResultadoIndicador("EMA 9/21 (Spread/ATR)", "tendencia", val_ema, res_ema),
-            ResultadoIndicador("MACD Hist/ATR", "tendencia", val_macd, res_macd),
-            ResultadoIndicador("VWAP Sesión (Z-Score %)", "tendencia", val_vwap, res_vwap),
-            ResultadoIndicador("ADX/DI (DI+ - DI-)", "tendencia", val_adx_di, res_adx_di),
-            ResultadoIndicador("Supertrend(10,2.5)/ATR", "tendencia", val_st, res_st),
-            ResultadoIndicador("CMF(20) Flujo Inst.", "tendencia", val_cmf, res_cmf),
-            ResultadoIndicador("Kaufman ER(14) Limpieza", "tendencia", er_firmado, res_er),
-        ]
-
-    # -----------------------------------------------------------------
-    # FLUJO DE VOLUMEN, ESTABILIDAD, CAMBIOS ABRUPTOS, P/E Y S&R
-    # -----------------------------------------------------------------
-    def analizar_flujo_y_fundamentales(
-        self, simbolo: str, serie: SerieOHLCV
-    ) -> AnalisisFlujoYFundamentales:
-        closes = serie.closes
-        precio_actual = closes[-1]
-        precio_prev = closes[-2] if len(closes) >= 2 else precio_actual
-        precio_inicio_ventana = closes[-min(len(closes), 16)]
-
-        cambio_pct_barra = (
-            ((precio_actual - precio_prev) / precio_prev) * 100.0 if precio_prev > 0 else 0.0
-        )
-        cambio_pct_sesion = (
-            ((precio_actual - precio_inicio_ventana) / precio_inicio_ventana) * 100.0
-            if precio_inicio_ventana > 0
-            else 0.0
-        )
-
-        atr_series = calcular_atr_lista(serie, periodo=14)
-        atr_actual = atr_series[-1] if atr_series else 0.01
-        salto_atr = (
-            (precio_actual - precio_prev) / atr_actual if atr_actual > 0 else 0.0
-        )
-
-        _, adx_actual, _, _ = calcular_adx_di(serie, periodo=14)
-        cmf_actual = calcular_cmf(serie, periodo=20)
-        divergencia = detectar_divergencia_rsi(serie, ventana=18)
-
-        # Evaluar Estabilidad y Erraticidad (Kaufman ER, Choppiness CHOP, R², Whipsaw, NATR%)
-        estabilidad = evaluar_estabilidad_accion(serie, atr_series, ventana=16)
-
-        # 1. Perfil de Volumen de Rango Fijo (FRVP)
-        poc, vah, val, rvol = calcular_perfil_volumen_rango_fijo(serie)
-        if precio_actual > vah:
-            estado_vol = f"Sobre VAH ({vah:.2f}) [Ruptura alcista de valor | RVOL {rvol:.2f}x]"
-        elif precio_actual < val:
-            estado_vol = f"Bajo VAL ({val:.2f}) [Desbalance bajista de valor | RVOL {rvol:.2f}x]"
-        else:
-            estado_vol = f"En Área de Valor [VAL {val:.2f} - POC {poc:.2f} - VAH {vah:.2f} | RVOL {rvol:.2f}x]"
-
-        # 2. Soporte y Resistencia
-        s1, s2, r1, r2 = calcular_soportes_resistencias(serie)
-        dist_soporte_pct = ((precio_actual - s1) / precio_actual) * 100.0 if precio_actual > 0 else 0.0
-        dist_resistencia_pct = ((r1 - precio_actual) / precio_actual) * 100.0 if precio_actual > 0 else 0.0
-
-        # 3. Datos Fundamentales (P/E, Beta, Rango 52 semanas)
-        fund = self._obtener_fundamentales_simbolo(simbolo, serie)
-        pe_t = fund.get("pe_trailing")
-        pe_f = fund.get("pe_forward")
-        beta = fund.get("beta")
-        pos_52s = float(fund.get("pos_52s") or 50.0)
-
-        if pe_t is not None:
-            if pe_t < 0:
-                lectura_pe = f"P/E {pe_t:.1f} (beneficio negativo/riesgo)"
-            elif pe_t < 16:
-                lectura_pe = f"P/E {pe_t:.1f} (descuento fundamental -> sesgo COMPRA)"
-            elif pe_t <= 32:
-                lectura_pe = f"P/E {pe_t:.1f} (valoración razonable)"
-            else:
-                lectura_pe = f"P/E {pe_t:.1f} (múltiplo exigente/prima crecimiento)"
-        else:
-            lectura_pe = "P/E N/D"
-
-        if pe_f is not None:
-            lectura_pe += f" | Fwd P/E {pe_f:.1f}"
-
-        lectura_sr = (
-            f"Soporte S1: {s1:.2f} (-{abs(dist_soporte_pct):.2f}%), S2: {s2:.2f} | "
-            f"Resistencia R1: {r1:.2f} (+{abs(dist_resistencia_pct):.2f}%), R2: {r2:.2f}"
-        )
-
-        etiqueta_est = (
-            f"DESCARTADA-ERRÁTICA ({estabilidad.motivo_descarte})"
-            if estabilidad.es_erratica
-            else f"Estable {estabilidad.indice_certeza:.0f}% (ER={estabilidad.efficiency_ratio:.2f}, CHOP={estabilidad.choppiness_index:.1f}, R²={estabilidad.r2_tendencia:.2f})"
-        )
-
-        analisis_fund_sr = (
-            f"Precio: ${precio_actual:.2f} | {lectura_pe} | {lectura_sr} | "
-            f"FRVP: {estado_vol} | CMF: {cmf_actual:+.2f} | Estabilidad: {etiqueta_est}"
-        )
-
-        # 4. Detección de Cambios Abruptos de Precio + Cruce con Noticias (infomarket)
-        alerta_abrupta: Optional[str] = None
-        tipo_alerta: Optional[str] = None
-        noticias_txt: List[str] = []
-
-        es_caida_abrupta = (not estabilidad.es_erratica) and cambio_pct_barra <= -0.5 and (
-            cambio_pct_barra <= -1.4
-            or salto_atr <= -1.35
-            or (cambio_pct_sesion <= -3.2 and cambio_pct_barra <= -0.85)
-            or (cambio_pct_barra <= -0.85 and rvol >= 1.75)
-        )
-        es_alza_abrupta = (not estabilidad.es_erratica) and cambio_pct_barra >= 0.5 and (
-            cambio_pct_barra >= 1.4
-            or salto_atr >= 1.35
-            or (cambio_pct_sesion >= 3.2 and cambio_pct_barra >= 0.85)
-            or (cambio_pct_barra >= 0.85 and rvol >= 1.75)
-        )
-
-        if es_caida_abrupta or es_alza_abrupta:
-            if self.gestor_noticias is not None:
-                noticias_rel = self.gestor_noticias.obtener_noticias_relevantes(
-                    simbolo, max_items=2
-                )
-                for n in noticias_rel:
-                    noticias_txt.append(
-                        f"[{n.simbolo}/{n.plataforma}] {n.titulo or 'Noticia'} -> {n.link}"
-                    )
-
-            if es_caida_abrupta:
-                tipo_alerta = "venta"
-                razon_noticias = (
-                    " | ".join(noticias_txt)
-                    if noticias_txt
-                    else "Sin noticia corporativa directa en caché; vigilar presión macro/Fed o liquidación de bloque."
-                )
-                alerta_abrupta = (
-                    f"CAÍDA ABRUPTA DETECTADA ({cambio_pct_barra:+.2f}% barra / {cambio_pct_sesion:+.2f}% sesión, "
-                    f"RVOL {rvol:.2f}x). Mitigación de golpe: vigilar soporte S1=${s1:.2f} y VAL=${val:.2f}. "
-                    f"Contexto noticias: {razon_noticias}"
-                )
-            elif es_alza_abrupta:
-                tipo_alerta = "compra"
-                razon_noticias = (
-                    " | ".join(noticias_txt)
-                    if noticias_txt
-                    else "Flujo comprador institucional / ruptura sobre área de valor."
-                )
-                alerta_abrupta = (
-                    f"ALZA ABRUPTA CON FLUJO ({cambio_pct_barra:+.2f}% barra / {cambio_pct_sesion:+.2f}% sesión, "
-                    f"RVOL {rvol:.2f}x). Oportunidad de entrada antes de agotamiento: margen hasta R1=${r1:.2f} "
-                    f"(+{abs(dist_resistencia_pct):.2f}%), POC=${poc:.2f}. Catalizador: {razon_noticias}"
-                )
-
-        return AnalisisFlujoYFundamentales(
-            simbolo=simbolo,
-            precio_actual=precio_actual,
-            cambio_pct_barra=cambio_pct_barra,
-            cambio_pct_sesion=cambio_pct_sesion,
-            atr_actual=atr_actual,
-            adx_actual=adx_actual,
-            cmf_actual=cmf_actual,
-            divergencia=divergencia,
-            estabilidad=estabilidad,
-            poc=poc,
-            vah=vah,
-            val=val,
-            rvol=rvol,
-            estado_volumen=estado_vol,
-            soporte_1=s1,
-            soporte_2=s2,
-            resistencia_1=r1,
-            resistencia_2=r2,
-            dist_soporte_pct=dist_soporte_pct,
-            dist_resistencia_pct=dist_resistencia_pct,
-            pe_trailing=pe_t,
-            pe_forward=pe_f,
-            beta=beta,
-            pos_rango_52s_pct=pos_52s,
-            alerta_abrupta=alerta_abrupta,
-            tipo_alerta=tipo_alerta,
-            analisis_fundamental_sr=analisis_fund_sr,
-            noticias_asociadas=noticias_txt,
-        )
-
-    # -----------------------------------------------------------------
-    # MOTOR DE CONFLUENCIA MULTICAPA CON FILTRO ANTI-ERRÁTICO
-    # -----------------------------------------------------------------
-    def evaluar_alto_potencial(
-        self,
-        indicadores: List[ResultadoIndicador],
-        flujo: AnalisisFlujoYFundamentales,
-    ) -> EvaluacionAltoPotencial:
-        """
-        Evalúa si existe un "evento con alto potencial de compra o venta" exigiendo:
-          0) PUERTA DE ESTABILIDAD (Anti-Errático): Si `flujo.estabilidad.es_erratica` es True
-             (bajo Kaufman ER, alto Choppiness CHOP, alto Whipsaw o volatilidad NATR desordenada),
-             descarta automáticamente la acción.
-          1) Régimen ADX (Tendencial vs. Rango/Reversión).
-          2) Consenso multicapa de indicadores (>= 4 alineados).
-          3) Confirmación de Flujo Institucional (CMF 20 + FRVP) y Persistencia de Cierre.
-          4) Estructura Soporte/Resistencia y Valoración Fundamental (P/E).
-        """
-        est = flujo.estabilidad
-        riesgo_compra = max(flujo.precio_actual - flujo.soporte_1, 0.5 * flujo.atr_actual)
-        beneficio_compra = max(flujo.resistencia_1 - flujo.precio_actual, 0.1 * flujo.atr_actual)
-        rr_compra = beneficio_compra / riesgo_compra if riesgo_compra > 0 else 1.0
-
-        riesgo_venta = max(flujo.resistencia_1 - flujo.precio_actual, 0.5 * flujo.atr_actual)
-        beneficio_venta = max(flujo.precio_actual - flujo.soporte_1, 0.1 * flujo.atr_actual)
-        rr_venta = beneficio_venta / riesgo_venta if riesgo_venta > 0 else 1.0
-
-        en_tendencia = flujo.adx_actual >= 22.0
-        regimen_str = (
-            f"Tendencial (ADX {flujo.adx_actual:.1f}, ER {est.efficiency_ratio:.2f})"
-            if en_tendencia
-            else f"Rango/Reversión (ADX {flujo.adx_actual:.1f}, CHOP {est.choppiness_index:.1f})"
-        )
-
-        # PUERTA 0: Descartar inmediatamente acciones con comportamiento altamente errático o volátil
-        if est.es_erratica:
-            return EvaluacionAltoPotencial(
-                es_alto_potencial=False,
-                direccion=None,
-                etiqueta_cli=f"descartada por comportamiento errático ({est.motivo_descarte})",
-                score=0.0,
-                confianza_pct=0.0,
-                certeza_estabilidad_pct=est.indice_certeza,
-                regimen=regimen_str,
-                indicadores_a_favor=0,
-                total_indicadores=len(indicadores),
-                ratio_riesgo_beneficio=1.0,
-                stop_loss=flujo.soporte_1,
-                take_profit=flujo.resistencia_1,
-                razones_clave=[f"Descartada: {est.motivo_descarte}"],
-            )
-
-        mapa_puntos = {
-            "venta fuerte": -2.0,
-            "venta": -1.0,
-            "neutral": 0.0,
-            "compra": 1.0,
-            "compra fuerte": 2.0,
-        }
-
-        suma_ponderada = 0.0
-        peso_maximo = 0.0
-        compras_total = 0
-        compras_fuertes = 0
-        ventas_total = 0
-        ventas_fuertes = 0
-        supertrend_res = "neutral"
-
-        for ind in indicadores:
-            pts = mapa_puntos.get(ind.resultado, 0.0)
-            if "CMF" in ind.nombre:
-                peso = 1.45
-            elif "Supertrend" in ind.nombre:
-                peso = 1.35
-                supertrend_res = ind.resultado
-            elif "Kaufman ER" in ind.nombre:
-                peso = 1.35
-            elif ind.tipo == "tendencia":
-                peso = 1.30 if en_tendencia else 0.95
-            else:
-                peso = 0.85 if en_tendencia else 1.25
-
-            suma_ponderada += pts * peso
-            peso_maximo += 2.0 * peso
-
-            if ind.resultado in ("compra", "compra fuerte"):
-                compras_total += 1
-                if ind.resultado == "compra fuerte":
-                    compras_fuertes += 1
-            elif ind.resultado in ("venta", "venta fuerte"):
-                ventas_total += 1
-                if ind.resultado == "venta fuerte":
-                    ventas_fuertes += 1
-
-        score = (suma_ponderada / peso_maximo) * 70.0 if peso_maximo > 0 else 0.0
-        razones: List[str] = []
-
-        # Bonificación por alta certeza estructural (ER alto, CHOP bajo, R² sólido)
-        if est.efficiency_ratio >= 0.30 and est.choppiness_index <= 52.0:
-            bono_est = 6.5 if score >= 0 else -6.5
-            score += bono_est
-            razones.append(
-                f"Trayectoria limpia (ER={est.efficiency_ratio:.2f}, CHOP={est.choppiness_index:.1f}, R²={est.r2_tendencia:.2f})"
-            )
-
-        # Flujo de Volumen (FRVP + CMF + RVOL)
-        if flujo.cmf_actual >= 0.06:
-            score += 7.0
-            razones.append(f"Acumulación CMF({flujo.cmf_actual:+.2f})")
-        elif flujo.cmf_actual <= -0.06:
-            score -= 7.0
-            razones.append(f"Distribución CMF({flujo.cmf_actual:+.2f})")
-
-        if flujo.precio_actual > flujo.vah and flujo.rvol >= 1.10:
-            score += 6.0
-            razones.append(f"Ruptura sobre VAH con RVOL {flujo.rvol:.2f}x")
-        elif flujo.precio_actual < flujo.val and flujo.rvol >= 1.10:
-            score -= 6.0
-            razones.append(f"Ruptura bajo VAL con RVOL {flujo.rvol:.2f}x")
-
-        if flujo.dist_soporte_pct <= 1.5 and score > 0:
-            score += 5.5
-            razones.append(f"Rebote cercano a S1 (${flujo.soporte_1:.2f})")
-        elif flujo.dist_resistencia_pct <= 1.5 and score < 0:
-            score -= 5.5
-            razones.append(f"Rechazo cercano a R1 (${flujo.resistencia_1:.2f})")
-
-        if flujo.divergencia == "alcista":
-            score += 7.5
-            razones.append("Divergencia Alcista RSI/Precio")
-        elif flujo.divergencia == "bajista":
-            score -= 7.5
-            razones.append("Divergencia Bajista RSI/Precio")
-
-        if flujo.pe_trailing is not None:
-            if 0 < flujo.pe_trailing < 18.0 and score > 0:
-                score += 4.0
-                razones.append(f"P/E atractivo ({flujo.pe_trailing:.1f}x)")
-            elif (flujo.pe_trailing < 0 or flujo.pe_trailing > 45.0) and score < 0:
-                score -= 4.0
-                razones.append(f"Múltiplo P/E exigente ({flujo.pe_trailing:.1f}x)")
-
-        score = max(-100.0, min(100.0, score))
-
-        # PUERTAS DE ALTA CERTEZA (Indicadores + Estabilidad Anti-Errática + Flujo):
-        es_compra_potencial = (
-            not est.es_erratica
-            and est.indice_certeza >= 46.0
-            and est.choppiness_index <= 59.5
-            and score >= 32.0
-            and (compras_total >= 4 or (compras_total >= 3 and compras_fuertes >= 2))
-            and ventas_fuertes <= 1
-            and est.persistencia_direccion >= -1
-            and not (supertrend_res == "venta fuerte" and flujo.cmf_actual < -0.08)
-        )
-
-        es_venta_potencial = (
-            not est.es_erratica
-            and est.indice_certeza >= 46.0
-            and est.choppiness_index <= 59.5
-            and score <= -32.0
-            and (ventas_total >= 4 or (ventas_total >= 3 and ventas_fuertes >= 2))
-            and compras_fuertes <= 1
-            and est.persistencia_direccion <= 1
-            and not (supertrend_res == "compra fuerte" and flujo.cmf_actual > 0.08)
-        )
-
-        if es_compra_potencial:
-            confianza = min(98.0, 52.0 + abs(score) * 0.32 + est.indice_certeza * 0.18)
-            stop_loss = min(flujo.soporte_1, flujo.precio_actual - 1.5 * flujo.atr_actual)
-            take_profit = max(flujo.resistencia_1, flujo.precio_actual + 2.2 * flujo.atr_actual)
-            razones.insert(
-                0,
-                f"{compras_total}/{len(indicadores)} ind. alcistas ({compras_fuertes} fuertes) | Certeza Estabilidad {est.indice_certeza:.0f}%",
-            )
-            return EvaluacionAltoPotencial(
-                es_alto_potencial=True,
-                direccion="compra",
-                etiqueta_cli="evento con alto potencial de compra",
-                score=score,
-                confianza_pct=confianza,
-                certeza_estabilidad_pct=est.indice_certeza,
-                regimen=regimen_str,
-                indicadores_a_favor=compras_total,
-                total_indicadores=len(indicadores),
-                ratio_riesgo_beneficio=rr_compra,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                razones_clave=razones,
-            )
-
-        if es_venta_potencial:
-            confianza = min(98.0, 52.0 + abs(score) * 0.32 + est.indice_certeza * 0.18)
-            stop_loss = max(flujo.resistencia_1, flujo.precio_actual + 1.5 * flujo.atr_actual)
-            take_profit = min(flujo.soporte_1, flujo.precio_actual - 2.2 * flujo.atr_actual)
-            razones.insert(
-                0,
-                f"{ventas_total}/{len(indicadores)} ind. bajistas ({ventas_fuertes} fuertes) | Certeza Estabilidad {est.indice_certeza:.0f}%",
-            )
-            return EvaluacionAltoPotencial(
-                es_alto_potencial=True,
-                direccion="venta",
-                etiqueta_cli="evento con alto potencial de venta",
-                score=score,
-                confianza_pct=confianza,
-                certeza_estabilidad_pct=est.indice_certeza,
-                regimen=regimen_str,
-                indicadores_a_favor=ventas_total,
-                total_indicadores=len(indicadores),
-                ratio_riesgo_beneficio=rr_venta,
-                stop_loss=stop_loss,
-                take_profit=take_profit,
-                razones_clave=razones,
-            )
-
-        return EvaluacionAltoPotencial(
-            es_alto_potencial=False,
-            direccion=None,
-            etiqueta_cli="sin confluencia de alto potencial (ruido/volatilidad filtrada)",
-            score=score,
-            confianza_pct=min(60.0, abs(score)),
-            certeza_estabilidad_pct=est.indice_certeza,
-            regimen=regimen_str,
-            indicadores_a_favor=max(compras_total, ventas_total),
-            total_indicadores=len(indicadores),
-            ratio_riesgo_beneficio=rr_compra if score >= 0 else rr_venta,
-            stop_loss=flujo.soporte_1,
-            take_profit=flujo.resistencia_1,
-            razones_clave=razones,
-        )
-
-    # -----------------------------------------------------------------
-    # IMPRESIÓN Y GESTIÓN DE CAMBIOS EN TERMINAL
-    # -----------------------------------------------------------------
-    def _imprimir_bloque_accion(
-        self,
-        ahora_str: str,
-        simbolo: str,
-        indicadores: List[ResultadoIndicador],
-        flujo: AnalisisFlujoYFundamentales,
-        evaluacion: EvaluacionAltoPotencial,
-    ) -> None:
-        simbolo_turquesa = resaltar_turquesa(simbolo)
-
-        for ind in indicadores:
-            nombre_coloreado = colorear_nombre_indicador(ind.nombre, ind.cambio_motivo)
-            resultado_coloreado = colorear_segun_resultado(ind.resultado, ind.resultado)
-
-            print(
-                f"{ahora_str} | {simbolo_turquesa} | {nombre_coloreado} | "
-                f"{ind.tipo} | {resultado_coloreado}"
-            )
-
-        print(
-            f"{ahora_str} | {simbolo_turquesa} | "
-            f"{ColoresIndicadores.CIAN}[FLUJO/P-E/S&R]{ColoresIndicadores.RESET} "
-            f"{flujo.analisis_fundamental_sr}"
-        )
-
-        if evaluacion.es_alto_potencial:
-            color_potencial = (
-                ColoresIndicadores.RESALTADO_COMPRA_INDICADOR
-                if evaluacion.direccion == "compra"
-                else ColoresIndicadores.RESALTADO_VENTA_INDICADOR
-            )
-            resumen_razones = " + ".join(evaluacion.razones_clave[:4])
-            print(
-                f"{ahora_str} | {simbolo_turquesa} | "
-                f"{color_potencial} {evaluacion.etiqueta_cli.upper()} {ColoresIndicadores.RESET} | "
-                f"Confianza: {evaluacion.confianza_pct:.1f}% (Score {evaluacion.score:+.1f}/100) | "
-                f"Régimen: {evaluacion.regimen} | R:R {evaluacion.ratio_riesgo_beneficio:.2f}x "
-                f"(Stop: ${evaluacion.stop_loss:.2f} / Objetivo: ${evaluacion.take_profit:.2f}) | "
-                f"Base: {resumen_razones}"
-            )
-
-        if flujo.alerta_abrupta:
-            color_alerta = (
-                ColoresIndicadores.RESALTADO_COMPRA_INDICADOR
-                if flujo.tipo_alerta == "compra"
-                else ColoresIndicadores.RESALTADO_VENTA_INDICADOR
-            )
-            print(
-                f"{ahora_str} | {simbolo_turquesa} | "
-                f"{color_alerta} ALERTA FLUJO/PRECIO {ColoresIndicadores.RESET} | "
-                f"{flujo.alerta_abrupta}"
-            )
-
-    def _registrar_instantanea(
-        self,
-        ahora_str: str,
-        simbolo: str,
-        indicadores: List[ResultadoIndicador],
-        flujo: AnalisisFlujoYFundamentales,
-        evaluacion: EvaluacionAltoPotencial,
-        agregar_a_historial_eventos: bool = False,
-    ) -> InstantaneaEventoTecnico:
-        snap = InstantaneaEventoTecnico(
-            timestamp=ahora_str,
-            ciclo=self.ciclo_actual,
-            simbolo=simbolo,
-            indicadores=list(indicadores),
-            flujo=flujo,
-            evaluacion=evaluacion,
-        )
-        self.ultima_instantanea_por_simbolo[simbolo] = snap
-        if agregar_a_historial_eventos:
-            hist = self.historial_eventos_por_simbolo.setdefault(simbolo, [])
-            hist.append(snap)
-            if len(hist) > 20:
-                self.historial_eventos_por_simbolo[simbolo] = hist[-20:]
-        return snap
-
-    def escanear_y_mostrar(self) -> bool:
-        """
-        Ejecuta el análisis técnico, de estabilidad anti-errático, de flujo y de confluencia:
-        - Primera vez: muestra todos los indicadores y registra la línea base.
-        - Siguientes veces: descarta acciones erráticas/volátiles y solo muestra aquellas que
-          superan el filtro de estabilidad y alcanzan un "EVENTO CON ALTO POTENCIAL DE COMPRA / VENTA".
-        - Expone los eventos detectados en `self.ultimos_eventos_potenciales` para el módulo de
-          enlace de Nivel 2 (`evento_potencial_para_analisis` + IA).
-        """
-        self.ciclo_actual += 1
-        self.ultimos_eventos_potenciales.clear()
-
-        datos_mercado = self._obtener_datos_mercado()
-        ahora = dt.datetime.now().astimezone()
-        ahora_str = formatear_fecha(ahora)
-
-        hubo_evento_mostrado = False
-        candidatos_potencial: List[
-            Tuple[float, str, List[ResultadoIndicador], AnalisisFlujoYFundamentales, EvaluacionAltoPotencial]
-        ] = []
-
-        for simbolo in self.empresas:
-            serie = datos_mercado.get(simbolo)
-            if serie is None or len(serie) == 0:
-                continue
-
-            indicadores = self.evaluar_indicadores_accion(serie)
-            ref_sym = self.estado_referencia.get(simbolo, {})
-            prev_inmediato = self.estado_ciclo_previo.get(simbolo, {})
-
-            cambios_compra_ref: List[str] = []
-            cambios_venta_ref: List[str] = []
-            cambios_frescos: List[str] = []
-
-            for ind in indicadores:
-                est_ref = ref_sym.get(ind.nombre)
-                if not self.primera_ejecucion and est_ref is not None and ind.resultado != est_ref:
-                    if ind.resultado in ("compra", "compra fuerte"):
-                        ind.cambio_motivo = "compra"
-                        cambios_compra_ref.append(ind.nombre)
-                    elif ind.resultado in ("venta", "venta fuerte"):
-                        ind.cambio_motivo = "venta"
-                        cambios_venta_ref.append(ind.nombre)
-
-                est_imm = prev_inmediato.get(ind.nombre)
-                if not self.primera_ejecucion and est_imm is not None and ind.resultado != est_imm:
-                    cambios_frescos.append(ind.nombre)
-
-            self.estado_ciclo_previo[simbolo] = {
-                ind.nombre: ind.resultado for ind in indicadores
+    def obtener_snapshot_e_historial(self, ticker: str) -> Tuple[Optional[AnalisisTecnicoTicker], List[AnalisisTecnicoTicker]]:
+        """Devuelve `(snapshot_actual, snapshots_previos)` para ampliar contexto de `analisis_ai.py`."""
+        tk = ticker.strip().upper()
+        with self._lock:
+            actual = self._snapshots_actuales.get(tk)
+            previos = list(self._historial_ticker.get(tk, []))[:-1]
+            return actual, previos
+
+    def obtener_snapshots_todos(self) -> Dict[str, AnalisisTecnicoTicker]:
+        """Devuelve una copia del mapa actual de snapshots técnicos para evaluación multi-ticker y sectorial."""
+        with self._lock:
+            return dict(self._snapshots_actuales)
+
+    def obtener_mapa_precios_y_pe(self) -> Dict[str, Dict[str, Optional[float]]]:
+        """Entrega precios actuales, P/E y S/R de todos los activos para valoración en vivo de `cartera.py`."""
+        with self._lock:
+            return {
+                tk: {
+                    "precio": snap.datos_financieros.precio_actual,
+                    "pe": snap.datos_financieros.pe_ratio,
+                    "soporte": snap.datos_financieros.soporte_1,
+                    "resistencia": snap.datos_financieros.resistencia_1,
+                    "evaluacion": snap.evaluacion_general,
+                    "direccion": snap.direccion_potencial,
+                    "certeza": snap.certeza_pct,
+                }
+                for tk, snap in self._snapshots_actuales.items()
             }
 
-            flujo = self.analizar_flujo_y_fundamentales(simbolo, serie)
-            evaluacion = self.evaluar_alto_potencial(indicadores, flujo)
+    def iniciar_monitoreo_continuo(self, callback_ciclo_precios: Optional[Callable[[Dict[str, Dict]], None]] = None) -> None:
+        """Lanza el hilo continuo de cálculo cuantitativo y el hilo asíncrono de fundamentales."""
+        self._detener.clear()
 
-            score_ant = self.score_previo.get(simbolo, evaluacion.score)
-            delta_score = evaluacion.score - score_ant
-            self.score_previo[simbolo] = evaluacion.score
-
-            precio_prev = self.ultimo_precio_por_simbolo.get(simbolo)
-            self.ultimo_precio_por_simbolo[simbolo] = serie.closes[-1]
-            hubo_variacion_precio = (
-                precio_prev is not None and abs(serie.closes[-1] - precio_prev) > 1e-6
+        if self._hilo_fundamentales is None or not self._hilo_fundamentales.is_alive():
+            self._hilo_fundamentales = threading.Thread(
+                target=self._refrescar_fundamentales_worker,
+                name="FundamentalesThread",
+                daemon=True,
             )
+            self._hilo_fundamentales.start()
 
-            if self.primera_ejecucion:
-                self.estado_referencia[simbolo] = {
-                    ind.nombre: ind.resultado for ind in indicadores
-                }
-                self._imprimir_bloque_accion(
-                    ahora_str, simbolo, indicadores, flujo, evaluacion
-                )
-                snap = self._registrar_instantanea(
-                    ahora_str,
-                    simbolo,
-                    indicadores,
-                    flujo,
-                    evaluacion,
-                    agregar_a_historial_eventos=evaluacion.es_alto_potencial,
-                )
-                if evaluacion.es_alto_potencial:
-                    self.ultimos_eventos_potenciales.append(snap)
-                hubo_evento_mostrado = True
-                continue
+        def _bucle() -> None:
+            while not self._detener.is_set():
+                try:
+                    self.actualizar_todos_los_tickers()
+                    if callback_ciclo_precios is not None:
+                        callback_ciclo_precios(self.obtener_mapa_precios_y_pe())
+                except Exception:
+                    pass
+                self._detener.wait(timeout=INTERVALO_CICLO_INDICADORES_SEG)
 
-            # Guardar siempre la instantánea más reciente para consultas de contexto AI
-            self._registrar_instantanea(
-                ahora_str, simbolo, indicadores, flujo, evaluacion, agregar_a_historial_eventos=False
+        if self._hilo_ciclo is None or not self._hilo_ciclo.is_alive():
+            self._hilo_ciclo = threading.Thread(
+                target=_bucle,
+                name="IndicadoresThread",
+                daemon=True,
             )
+            self._hilo_ciclo.start()
 
-            # Si la acción es errática, queda descartada de cualquier disparo
-            if flujo.estabilidad.es_erratica:
-                continue
-
-            ultimo_disp = self.ultimo_disparo_potencial.get(simbolo)
-            en_cooldown = (
-                ultimo_disp is not None
-                and ultimo_disp[1] == evaluacion.direccion
-                and (self.ciclo_actual - ultimo_disp[0]) < 8
-            )
-
-            tiene_evento_validado = False
-            if evaluacion.es_alto_potencial and not en_cooldown:
-                if evaluacion.direccion == "compra" and (
-                    bool(cambios_compra_ref) or delta_score >= 2.2
-                ):
-                    for ind in indicadores:
-                        if ind.cambio_motivo == "venta":
-                            ind.cambio_motivo = None
-                    if not cambios_compra_ref:
-                        for ind in indicadores:
-                            if ind.resultado == "compra fuerte":
-                                ind.cambio_motivo = "compra"
-                                break
-                    tiene_evento_validado = True
-                elif evaluacion.direccion == "venta" and (
-                    bool(cambios_venta_ref) or delta_score <= -2.2
-                ):
-                    for ind in indicadores:
-                        if ind.cambio_motivo == "compra":
-                            ind.cambio_motivo = None
-                    if not cambios_venta_ref:
-                        for ind in indicadores:
-                            if ind.resultado == "venta fuerte":
-                                ind.cambio_motivo = "venta"
-                                break
-                    tiene_evento_validado = True
-
-            if hubo_variacion_precio and flujo.alerta_abrupta is not None and not en_cooldown:
-                tiene_evento_validado = True
-
-            if tiene_evento_validado:
-                prioridad = (
-                    abs(evaluacion.score)
-                    + flujo.estabilidad.indice_certeza * 0.25
-                    + (15.0 if cambios_frescos else 0.0)
-                )
-                candidatos_potencial.append(
-                    (prioridad, simbolo, indicadores, flujo, evaluacion)
-                )
-
-        if not self.primera_ejecucion and candidatos_potencial:
-            candidatos_potencial.sort(key=lambda x: x[0], reverse=True)
-            for _, simbolo, indicadores, flujo, evaluacion in candidatos_potencial[:3]:
-                self._imprimir_bloque_accion(
-                    ahora_str, simbolo, indicadores, flujo, evaluacion
-                )
-                self.estado_referencia[simbolo] = {
-                    ind.nombre: ind.resultado for ind in indicadores
-                }
-                if evaluacion.direccion:
-                    self.ultimo_disparo_potencial[simbolo] = (
-                        self.ciclo_actual,
-                        evaluacion.direccion,
-                    )
-                snap = self._registrar_instantanea(
-                    ahora_str,
-                    simbolo,
-                    indicadores,
-                    flujo,
-                    evaluacion,
-                    agregar_a_historial_eventos=True,
-                )
-                self.ultimos_eventos_potenciales.append(snap)
-                hubo_evento_mostrado = True
-
-        self.primera_ejecucion = False
-        self._guardar_historial_disco()
-
-        if not hubo_evento_mostrado:
-            etiqueta_azul = resaltar_azul("indicadores")
-            print(f"{ahora_str} | sin cambios [{etiqueta_azul}]")
-
-        return hubo_evento_mostrado
-
-
-if __name__ == "__main__":
-    gestor_ind = GestorIndicadores()
-    gestor_ind.limpiar_historial()
-    gestor_ind.escanear_y_mostrar()
+    def detener(self) -> None:
+        self._detener.set()
