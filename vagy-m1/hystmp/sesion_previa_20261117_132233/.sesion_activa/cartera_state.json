@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-11-17 11:13:17 AM",
+  "fecha_inicio": "2026-11-17 11:02:03 AM",
+  "modelo_ai": "SONNET",
+  "modo_operacion": "SHORT Y LONG",
+  "lista_acciones": "Lista 2",
+  "modo_cierre_activo": "Cierre inmediato",
+  "capital_inicial_usd": 1000.0,
+  "patrimonio_actual_usd": 1000.22,
+  "efectivo_usd": 1000.22,
+  "efectivo_pct": 100.0,
+  "exposicion_pct": 0.0,
+  "pyg_latente_usd": 0,
+  "pyg_realizado_usd": 0.22,
+  "pyg_total_usd": 0.22,
+  "rendimiento_total_pct": 0.02,
+  "operaciones_cerradas": 7,
+  "rotaciones_ejecutadas": 0,
+  "win_rate_pct": 42.9,
+  "posiciones": []
+}

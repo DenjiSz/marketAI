@@ -1,0 +1,23 @@
+{
+  "fecha_inicio": "2026-11-16 11:24:49 PM",
+  "fecha_cierre": "2026-11-16 11:26:12 PM",
+  "modelo_ai": "flash",
+  "model_id": "gemini-3.8-flash",
+  "modo_operacion": "Short y Long",
+  "lista_nombre": "Lista 2",
+  "total_tickers": 49,
+  "modo_cierre": "Opción 3: Cierre inmediato",
+  "capital_inicial_usd": 1000.0,
+  "patrimonio_final_usd": 1000.0,
+  "rendimiento_total_pct": 0.0,
+  "pyg_total_usd": 0.0,
+  "operaciones_cerradas": 0,
+  "rotaciones_ejecutadas": 0,
+  "win_rate_pct": 0.0,
+  "ai_total_consultas": 11,
+  "ai_alcistas": 0,
+  "ai_bajistas": 0,
+  "ai_neutrales": 0,
+  "ai_errores": 11,
+  "total_noticias": 831
+}

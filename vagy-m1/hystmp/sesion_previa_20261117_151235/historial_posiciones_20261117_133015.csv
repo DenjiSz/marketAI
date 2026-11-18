@@ -1,0 +1,8 @@
+﻿id_posicion,fecha_apertura,ticker,tipo_operacion,tamano_porcentual_cartera,tamano_usd,precio_apertura,fecha_cierre,precio_cierre,pyg_porcentual,pyg_usd,motivo_cierre
+FA0E5638,2026-11-17 01:24:37 PM,V,SHORT,10.00%,100.00,419.4000,2026-11-17 01:30:15 PM,419.5800,-0.04%,-0.04,Cierre inmediato (/quit Opción 3)
+FFCE7766,2026-11-17 01:24:37 PM,GOOGL,SHORT,12.00%,120.00,280.9200,2026-11-17 01:30:15 PM,280.4000,+0.19%,+0.22,Cierre inmediato (/quit Opción 3)
+50B6DBF3,2026-11-17 01:25:07 PM,CRM,SHORT,10.00%,100.00,196.4000,2026-11-17 01:30:15 PM,196.7200,-0.16%,-0.16,Cierre inmediato (/quit Opción 3)
+E80E4FA1,2026-11-17 01:25:07 PM,SONY,SHORT,12.00%,120.00,26.7100,2026-11-17 01:30:15 PM,26.7000,+0.04%,+0.04,Cierre inmediato (/quit Opción 3)
+2534CBF7,2026-11-17 01:25:07 PM,TSEM,LONG,10.00%,100.00,133.8800,2026-11-17 01:30:15 PM,133.8800,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+3D47D62C,2026-11-17 01:25:13 PM,COHR,SHORT,10.00%,100.00,207.5100,2026-11-17 01:30:15 PM,207.4400,+0.03%,+0.03,Cierre inmediato (/quit Opción 3)
+F35AA572,2026-11-17 01:25:26 PM,TM,SHORT,10.00%,100.00,213.4400,2026-11-17 01:30:15 PM,213.3300,+0.05%,+0.05,Cierre inmediato (/quit Opción 3)

@@ -1,0 +1,21 @@
+{
+  "timestamp": "2026-11-17 10:45:02 AM",
+  "fecha_inicio": "2026-11-17 10:45:01 AM",
+  "modelo_ai": "FLASH",
+  "modo_operacion": "SPOT",
+  "lista_acciones": "Lista 2",
+  "modo_cierre_activo": "Cierre inmediato",
+  "capital_inicial_usd": 1000.0,
+  "patrimonio_actual_usd": 1000.0,
+  "efectivo_usd": 1000.0,
+  "efectivo_pct": 100.0,
+  "exposicion_pct": 0.0,
+  "pyg_latente_usd": 0,
+  "pyg_realizado_usd": 0.0,
+  "pyg_total_usd": 0.0,
+  "rendimiento_total_pct": 0.0,
+  "operaciones_cerradas": 0,
+  "rotaciones_ejecutadas": 0,
+  "win_rate_pct": 0.0,
+  "posiciones": []
+}

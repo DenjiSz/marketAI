@@ -1,0 +1,4 @@
+﻿id_posicion,fecha_apertura,ticker,tipo_operacion,tamano_porcentual_cartera,tamano_usd,precio_apertura,fecha_cierre,precio_cierre,pyg_porcentual,pyg_usd,motivo_cierre
+F38DC6A3,2026-11-17 03:31:45 PM,GEV,LONG,15.00%,150.00,779.9900,2026-11-17 03:31:58 PM,779.9900,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+EDFA9D35,2026-11-17 03:31:45 PM,SONY,SHORT,12.00%,120.00,26.6800,2026-11-17 03:31:58 PM,26.6800,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+BE056ABC,2026-11-17 03:31:52 PM,BRKB,SHORT,10.00%,100.00,587.2100,2026-11-17 03:31:58 PM,587.2100,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)

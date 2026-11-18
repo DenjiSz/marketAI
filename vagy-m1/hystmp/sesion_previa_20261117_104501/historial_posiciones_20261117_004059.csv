@@ -1,0 +1,8 @@
+﻿id_posicion,fecha_apertura,ticker,tipo_operacion,tamano_porcentual_cartera,tamano_usd,precio_apertura,fecha_cierre,precio_cierre,pyg_porcentual,pyg_usd,motivo_cierre
+72F39221,2026-11-17 12:39:16 AM,CEG,LONG,15.00%,150.00,277.7500,2026-11-17 12:40:53 AM,277.7500,+0.00%,+0.00,"Rotación IA -> CRDO (87% certeza): Potencial previo 72/100, el más bajo de la cartera y sin P&L acumulado que defender. Libera 15% del patrimonio para financiar el SHORT en CRDO, que presenta certeza técnica del 87% con confluencia de 5 alarmas de VENTA simultáneas y catalizador bajista intradiario confirmado."
+1B5FD7EE,2026-11-17 12:39:48 AM,GIL,LONG,4.95%,49.50,34.5600,2026-11-17 12:40:53 AM,34.5600,+0.00%,+0.00,"Rotación IA -> CRDO (87% certeza): Potencial previo 72/100 (empatado como el más débil), P&L en cero. Liquidación parcial del 33% (~5% del patrimonio) para completar la asignación requerida sin sobreexposición. CRDO SHORT ofrece perfil riesgo/retorno sustancialmente superior en el corto plazo."
+738986AE,2026-11-17 12:39:33 AM,MRK,SHORT,20.00%,200.00,144.5100,2026-11-17 12:40:59 AM,144.5100,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+1B5FD7EE,2026-11-17 12:39:48 AM,GIL,LONG,10.05%,100.50,34.5600,2026-11-17 12:40:59 AM,34.5600,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+B1993732,2026-11-17 12:40:07 AM,FLEX,LONG,15.00%,150.00,74.8500,2026-11-17 12:40:59 AM,74.8500,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+7FEE8D38,2026-11-17 12:40:27 AM,ASML,SHORT,20.00%,200.00,1406.5100,2026-11-17 12:40:59 AM,1406.5100,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)
+C29527F2,2026-11-17 12:40:53 AM,CRDO,SHORT,20.00%,200.00,120.5900,2026-11-17 12:40:59 AM,120.5900,+0.00%,+0.00,Cierre inmediato (/quit Opción 3)

@@ -1,0 +1,23 @@
+{
+  "fecha_inicio": "2026-11-17 11:02:03 AM",
+  "fecha_cierre": "2026-11-17 11:13:17 AM",
+  "modelo_ai": "sonnet",
+  "model_id": "claude-sonnet-4-6",
+  "modo_operacion": "Short y Long",
+  "lista_nombre": "Lista 2",
+  "total_tickers": 49,
+  "modo_cierre": "Opción 3: Cierre inmediato",
+  "capital_inicial_usd": 1000.0,
+  "patrimonio_final_usd": 1000.22,
+  "rendimiento_total_pct": 0.02,
+  "pyg_total_usd": 0.22,
+  "operaciones_cerradas": 7,
+  "rotaciones_ejecutadas": 0,
+  "win_rate_pct": 42.9,
+  "ai_total_consultas": 43,
+  "ai_alcistas": 1,
+  "ai_bajistas": 7,
+  "ai_neutrales": 26,
+  "ai_errores": 9,
+  "total_noticias": 1536
+}

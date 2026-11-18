@@ -1,0 +1,9 @@
+{
+  "activa": false,
+  "cerrando": true,
+  "modo_cierre": "Interrupción Ctrl+C",
+  "parent_pid": 20084,
+  "inicio_sesion": "2026-11-17 10:45:01 AM",
+  "inicio_epoch": 1794933901.326248,
+  "heartbeat_epoch": 1794933902.4993076
+}

@@ -1,0 +1,12 @@
+{
+  "activa": false,
+  "cerrando": true,
+  "modo_cierre": "Opción 3: Cierre inmediato",
+  "parent_pid": 3216,
+  "inicio_sesion": "2026-11-17 11:01:43 AM",
+  "inicio_epoch": 1794934903.8414671,
+  "heartbeat_epoch": 1794935602.5833135,
+  "modelo_ai": "sonnet",
+  "modo_operacion": "short y long",
+  "lista_acciones": "Lista 2"
+}
