@@ -488,6 +488,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["gemini-3.8-flash"],
         "niveles_esfuerzo": ["low", "medium", "high"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 0.75, "output": 3.75, "cached": 0.075, "post_2027_input": 1.50, "post_2027_output": 7.50, "post_2027_cached": 0.15},
         "descripcion": "Gemini 3.6 Flash — Veloz y eficiente (effort: low, medium, high)",
     },
     "flash3.7": {
@@ -498,6 +499,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["gemini-3.8-flash"],
         "niveles_esfuerzo": ["low", "medium", "high"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 0.75, "output": 3.75, "cached": 0.075, "post_2027_input": 1.50, "post_2027_output": 7.50, "post_2027_cached": 0.15},
         "descripcion": "Gemini 3.7 Flash — Precisión agéntica mejorada (effort: low, medium, high)",
     },
     "flash3.8": {
@@ -508,6 +510,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": [],
         "niveles_esfuerzo": ["low", "medium", "high"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 0.75, "output": 3.75, "cached": 0.075, "post_2027_input": 1.50, "post_2027_output": 7.50, "post_2027_cached": 0.15},
         "descripcion": "Gemini 3.8 Flash — Alta velocidad y balance (effort: low, medium, high)",
     },
     "argon": {
@@ -518,6 +521,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["gemini-3.8-flash"],
         "niveles_esfuerzo": ["low", "medium", "high"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 2.00, "output": 10.00, "cached": 0.10, "post_dec2026_input": 4.00, "post_dec2026_output": 20.00, "post_dec2026_cached": 0.20},
         "descripcion": "Gemini 4 Argon — Razonamiento frontera eficiente (effort: low, medium, high)",
     },
     "hydrogen": {
@@ -528,6 +532,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["gemini-4-argon"],
         "niveles_esfuerzo": ["low", "medium", "high", "xhigh"],
         "esfuerzo_default": "high",
+        "precios_1m": {"input": 1.50, "output": 7.50, "cached": 0.15},
         "descripcion": "Gemini 4 Hydrogen — Rápido con modo profundo (effort: low, medium, high, xhigh)",
     },
     "carbon": {
@@ -538,6 +543,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["gemini-4-argon"],
         "niveles_esfuerzo": ["low", "medium", "high"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 2.00, "output": 10.00, "cached": 0.10, "post_dec2026_input": 4.00, "post_dec2026_output": 20.00, "post_dec2026_cached": 0.20},
         "descripcion": "Gemini 4 Carbon — Máxima profundidad analítica (effort: low, medium, high)",
     },
     "pro3.1": {
@@ -548,6 +554,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": [],
         "niveles_esfuerzo": ["low", "high"],
         "esfuerzo_default": "high",
+        "precios_1m": {"input": 2.00, "output": 12.00, "cached": 0.20, "input_gt200k": 4.00, "output_gt200k": 18.00, "cached_gt200k": 0.40},
         "descripcion": "Gemini 3.1 Pro — Razonamiento complejo (effort: low, high)",
     },
     "sonnet": {
@@ -558,6 +565,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["claude-sonnet-4-6", "claude-3-7-sonnet-latest"],
         "niveles_esfuerzo": ["low", "medium", "high", "xhigh", "max"],
         "esfuerzo_default": "high",
+        "precios_1m": {"input": 2.00, "output": 10.00, "cached": 0.10},
         "descripcion": "Claude Sonnet 5.5 — Balance financiero rápido (effort: low, medium, high, xhigh, max)",
     },
     "opus": {
@@ -568,6 +576,7 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["claude-opus-4-6", "claude-3-opus-latest"],
         "niveles_esfuerzo": ["low", "medium", "high", "xhigh", "max"],
         "esfuerzo_default": "medium",
+        "precios_1m": {"input": 4.00, "output": 20.00, "cached": 0.20},
         "descripcion": "Claude Opus 5.5 — Análisis profundo multi-cartera (effort: low, medium, high, xhigh, max)",
     },
     "fable": {
@@ -578,9 +587,71 @@ MODELOS_IA_DISPONIBLES: Dict[str, Dict[str, Any]] = {
         "fallback_ids": ["claude-opus-5-5", "claude-opus-4-6"],
         "niveles_esfuerzo": ["low", "medium", "high", "xhigh", "max"],
         "esfuerzo_default": "high",
+        "precios_1m": {"input": 8.00, "output": 40.00, "cached": 0.20},
         "descripcion": "Claude Fable 5.2 — Modelo frontera insignia (effort: low, medium, high, xhigh, max)",
     },
 }
+
+
+def calcular_costo_consulta_usd(
+    modelo_clave: str,
+    input_tokens: int,
+    output_tokens: int,
+    cached_tokens: int = 0,
+    thought_tokens: int = 0,
+    total_tokens_reportados: int = 0,
+) -> Optional[float]:
+    """
+    Calcula el costo estimado en USD de una consulta a IA usando las tarifas oficiales
+    vigentes por 1M de tokens (`input`, `output` incluyendo thinking tokens y `cached`).
+    """
+    clave = resolver_clave_modelo(modelo_clave)
+    if not clave or clave not in MODELOS_IA_DISPONIBLES:
+        return None
+    precios = dict(MODELOS_IA_DISPONIBLES[clave].get("precios_1m", {}))
+    if not precios:
+        return None
+
+    ahora_fecha = datetime.now(timezone.utc).date()
+    if ahora_fecha >= datetime(2027, 1, 1).date() and "post_2027_input" in precios:
+        rate_in = float(precios["post_2027_input"])
+        rate_out = float(precios["post_2027_output"])
+        rate_cache = float(precios.get("post_2027_cached", rate_in * 0.1))
+    elif ahora_fecha >= datetime(2026, 12, 1).date() and "post_dec2026_input" in precios:
+        rate_in = float(precios["post_dec2026_input"])
+        rate_out = float(precios["post_dec2026_output"])
+        rate_cache = float(precios.get("post_dec2026_cached", rate_in * 0.05))
+    elif input_tokens > 200_000 and "input_gt200k" in precios:
+        rate_in = float(precios["input_gt200k"])
+        rate_out = float(precios["output_gt200k"])
+        rate_cache = float(precios.get("cached_gt200k", rate_in * 0.1))
+    else:
+        rate_in = float(precios["input"])
+        rate_out = float(precios["output"])
+        rate_cache = float(precios.get("cached", rate_in * 0.1))
+
+    in_toks = max(0, int(input_tokens))
+    cache_toks = min(in_toks, max(0, int(cached_tokens)))
+    uncached_in = max(0, in_toks - cache_toks)
+
+    out_toks = max(0, int(output_tokens))
+    th_toks = max(0, int(thought_tokens))
+    tot_rep = max(0, int(total_tokens_reportados))
+    if tot_rep > 0 and th_toks > 0:
+        # Evitar doble conteo si `output_tokens` ya incluye `thought_tokens`
+        if (in_toks + out_toks) >= tot_rep:
+            out_facturable = out_toks
+        else:
+            out_facturable = out_toks + th_toks
+    else:
+        out_facturable = out_toks + th_toks
+
+    costo = (
+        (uncached_in * rate_in)
+        + (cache_toks * rate_cache)
+        + (out_facturable * rate_out)
+    ) / 1_000_000.0
+    return round(costo, 6)
 
 ALIAS_MODELOS_IA: Dict[str, str] = {
     "flash": "flash3.8",
@@ -649,11 +720,16 @@ def _ahora_nueva_york(ahora_et: Optional[datetime] = None) -> datetime:
 def obtener_regimen_horario_mercado(ahora_et: Optional[datetime] = None) -> Dict[str, Any]:
     """
     Evalúa la hora actual de Nueva York (NYSE/NASDAQ) para ajustar la sensibilidad
-    del Smart Gatekeeper:
-    - Más PERMISIVO en `PRE_MARKET_APERTURA` (08:30-09:30 ET), `APERTURA_MERCADO` (09:30-10:45 ET)
-      y `CIERRE_MERCADO` (14:45-16:00 ET).
-    - ESTRICTO en `SESION_MEDIA` (10:45-14:45 ET) y `EXTENDIDO` (04:00-08:30 / 16:00-20:00 ET).
-    - MUY ESTRICTO en `MERCADO_CERRADO` (noches / fines de semana) para evitar neutrales inútiles.
+    del Smart Gatekeeper y minimizar consultas al modelo de IA (enfoque swing/alta convicción):
+    - VENTANAS FLEXIBLES (`es_permisivo=True`):
+      * `PRE_MARKET_APERTURA` (09:15-09:30 ET): 15 minutos antes de la apertura.
+      * `APERTURA_MERCADO` (09:30-09:50 ET): 20 minutos después de la apertura.
+      * `CIERRE_MERCADO` (15:45-16:00 ET): 15 minutos antes del cierre.
+    - VENTANAS ESTRICTAS (`es_permisivo=False`, `requiere_combinacion_estricta=True`):
+      * `SESION_MEDIA` (09:50-15:45 ET), `HORARIO_EXTENDIDO` (04:00-09:15 / 16:00-20:00 ET)
+        y `MERCADO_CERRADO` (noches / fines de semana): solo consultan ante combinaciones
+        estrictas multi-pilar (técnico/patrón + flujo/volumen + catalizador/reporte/8-K/Fed/Congreso)
+        de altísima certeza.
     """
     dt_ny = _ahora_nueva_york(ahora_et)
     dia_sem = dt_ny.weekday()  # 0=Lunes .. 6=Domingo
@@ -662,112 +738,167 @@ def obtener_regimen_horario_mercado(ahora_et: Optional[datetime] = None) -> Dict
     if dia_sem >= 5:
         return {
             "regimen": "MERCADO_CERRADO",
-            "etiqueta": "CERRADO (FIN SEMANA)",
+            "etiqueta": "CERRADO FIN SEMANA (SOLO COMBINACIÓN ESTRICTA)",
             "es_permisivo": False,
-            "umbral_confluencia": 82.0,
-            "ventana_lote_seg": 5.5,
-            "cooldown_neutral_seg": 600.0,
-            "enfriamiento_base_seg": 300.0,
+            "requiere_combinacion_estricta": True,
+            "min_pilares": 3,
+            "umbral_confluencia": 92.0,
+            "ventana_lote_seg": 45.0,
+            "cooldown_neutral_seg": 7200.0,
+            "enfriamiento_base_seg": 5400.0,
+            "max_consultas_hora": 4,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
-    if dt_time(8, 30) <= hora_local < dt_time(9, 30):
+    # Ventana flexible 1: 15 minutos antes de la apertura (09:15 - 09:30 ET)
+    if dt_time(9, 15) <= hora_local < dt_time(9, 30):
         return {
             "regimen": "PRE_MARKET_APERTURA",
-            "etiqueta": "PRE-MARKET APERTURA (PERMISIVO)",
+            "etiqueta": "PRE-MARKET 15m APERTURA (FLEXIBLE)",
             "es_permisivo": True,
-            "umbral_confluencia": 52.0,
-            "ventana_lote_seg": 2.5,
-            "cooldown_neutral_seg": 240.0,
-            "enfriamiento_base_seg": 110.0,
+            "requiere_combinacion_estricta": False,
+            "min_pilares": 2,
+            "umbral_confluencia": 66.0,
+            "ventana_lote_seg": 16.0,
+            "cooldown_neutral_seg": 2100.0,
+            "enfriamiento_base_seg": 1500.0,
+            "max_consultas_hora": 18,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
-    if dt_time(9, 30) <= hora_local < dt_time(10, 45):
+    # Ventana flexible 2: primeros 20 minutos tras apertura (09:30 - 09:50 ET)
+    if dt_time(9, 30) <= hora_local < dt_time(9, 50):
         return {
             "regimen": "APERTURA_MERCADO",
-            "etiqueta": "APERTURA SESIÓN (PERMISIVO)",
+            "etiqueta": "APERTURA 0-20m (FLEXIBLE)",
             "es_permisivo": True,
-            "umbral_confluencia": 54.0,
-            "ventana_lote_seg": 3.0,
-            "cooldown_neutral_seg": 270.0,
-            "enfriamiento_base_seg": 120.0,
+            "requiere_combinacion_estricta": False,
+            "min_pilares": 2,
+            "umbral_confluencia": 68.0,
+            "ventana_lote_seg": 18.0,
+            "cooldown_neutral_seg": 2100.0,
+            "enfriamiento_base_seg": 1500.0,
+            "max_consultas_hora": 20,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
-    if dt_time(10, 45) <= hora_local < dt_time(14, 45):
+    # Sesión media estricta (09:50 - 15:45 ET): evitar ruido de day trading
+    if dt_time(9, 50) <= hora_local < dt_time(15, 45):
         return {
             "regimen": "SESION_MEDIA",
-            "etiqueta": "MEDIA SESIÓN (ESTRICTO)",
+            "etiqueta": "SESIÓN MEDIA (ESTRICTA ANTI-RUIDO)",
             "es_permisivo": False,
-            "umbral_confluencia": 68.0,
-            "ventana_lote_seg": 4.5,
-            "cooldown_neutral_seg": 480.0,
-            "enfriamiento_base_seg": 210.0,
+            "requiere_combinacion_estricta": True,
+            "min_pilares": 3,
+            "umbral_confluencia": 88.0,
+            "ventana_lote_seg": 35.0,
+            "cooldown_neutral_seg": 5400.0,
+            "enfriamiento_base_seg": 3600.0,
+            "max_consultas_hora": 8,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
-    if dt_time(14, 45) <= hora_local < dt_time(16, 0):
+    # Ventana flexible 3: 15 minutos antes del cierre (15:45 - 16:00 ET)
+    if dt_time(15, 45) <= hora_local < dt_time(16, 0):
         return {
             "regimen": "CIERRE_MERCADO",
-            "etiqueta": "PRE-CIERRE SESIÓN (PERMISIVO)",
+            "etiqueta": "PRE-CIERRE 15m (FLEXIBLE)",
             "es_permisivo": True,
-            "umbral_confluencia": 54.0,
-            "ventana_lote_seg": 2.8,
-            "cooldown_neutral_seg": 260.0,
-            "enfriamiento_base_seg": 120.0,
+            "requiere_combinacion_estricta": False,
+            "min_pilares": 2,
+            "umbral_confluencia": 68.0,
+            "ventana_lote_seg": 16.0,
+            "cooldown_neutral_seg": 2100.0,
+            "enfriamiento_base_seg": 1500.0,
+            "max_consultas_hora": 18,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
-    if (dt_time(4, 0) <= hora_local < dt_time(8, 30)) or (dt_time(16, 0) <= hora_local < dt_time(20, 0)):
+    # Horario extendido temprano/after-hours fuera de la ventana de 15m (04:00-09:15 y 16:00-20:00 ET)
+    if (dt_time(4, 0) <= hora_local < dt_time(9, 15)) or (dt_time(16, 0) <= hora_local < dt_time(20, 0)):
         return {
             "regimen": "HORARIO_EXTENDIDO",
-            "etiqueta": "EXTENDIDO (SELECTIVO)",
+            "etiqueta": "EXTENDIDO (SOLO COMBINACIÓN ESTRICTA)",
             "es_permisivo": False,
-            "umbral_confluencia": 74.0,
-            "ventana_lote_seg": 5.0,
-            "cooldown_neutral_seg": 540.0,
-            "enfriamiento_base_seg": 240.0,
+            "requiere_combinacion_estricta": True,
+            "min_pilares": 3,
+            "umbral_confluencia": 90.0,
+            "ventana_lote_seg": 40.0,
+            "cooldown_neutral_seg": 6000.0,
+            "enfriamiento_base_seg": 4200.0,
+            "max_consultas_hora": 6,
             "hora_et": dt_ny.strftime("%I:%M %p ET"),
         }
 
     return {
         "regimen": "MERCADO_CERRADO",
-        "etiqueta": "NOCTURNO/CERRADO (MUY ESTRICTO)",
+        "etiqueta": "NOCTURNO/CERRADO (SOLO COMBINACIÓN ESTRICTA)",
         "es_permisivo": False,
-        "umbral_confluencia": 80.0,
-        "ventana_lote_seg": 5.5,
-        "cooldown_neutral_seg": 600.0,
-        "enfriamiento_base_seg": 300.0,
+        "requiere_combinacion_estricta": True,
+        "min_pilares": 3,
+        "umbral_confluencia": 94.0,
+        "ventana_lote_seg": 45.0,
+        "cooldown_neutral_seg": 7200.0,
+        "enfriamiento_base_seg": 5400.0,
+        "max_consultas_hora": 4,
         "hora_et": dt_ny.strftime("%I:%M %p ET"),
     }
 
 
 # ==============================================================================
-# 7. PARÁMETROS OPERATIVOS, UMBRALES Y CONSULTAS MÚLTIPLES EN LOTE
+# 7. SECCIONES DE ANÁLISIS, PARÁMETROS OPERATIVOS Y CONSULTAS EN LOTE
 # ==============================================================================
+
+SECCIONES_ANALISIS: Tuple[str, ...] = (
+    "NOTICIAS",
+    "FILINGS_8K",
+    "REPORTES_RESULTADOS",
+    "DIVULGACIONES_CONGRESO",
+    "FED",
+    "MACROECONOMIA",
+)
+
+ETIQUETAS_SECCIONES_ANALISIS: Dict[str, str] = {
+    "NOTICIAS": "Noticias",
+    "FILINGS_8K": "Filings 8-K",
+    "REPORTES_RESULTADOS": "Reportes Resultados",
+    "DIVULGACIONES_CONGRESO": "Divulgaciones Congreso",
+    "FED": "Fed / Tasas",
+    "MACROECONOMIA": "Macroeconomía",
+}
+
+SUBCATEGORIAS_CONGRESO: Tuple[str, ...] = (
+    "Ingresos ganados y no ganados",
+    "Activos y propiedades",
+    "Deudas y pasivos",
+    "Regalos y viajes pagados",
+    "Cargos externos y acuerdos",
+    "Finanzas familiares",
+)
 
 NOMBRE_DIR_HYSTMP = "hystmp"
 NOMBRE_DIR_SESION_ACTIVA = ".sesion_activa"
 
 # Intervalos de actualización (segundos)
-INTERVALO_CICLO_NOTICIAS_SEG = 25          # Sondeo continuo de fuentes RSS y Yahoo News
-INTERVALO_CICLO_INDICADORES_SEG = 35       # Descarga vectorizada por lotes de precios/indicadores
-UMBRAL_LATENCIA_NOTICIAS_ADVERTENCIA = 180 # 3 min sin noticias nuevas -> Estado VIGILANCIA
-UMBRAL_LATENCIA_NOTICIAS_ANORMAL = 420     # 7 min sin noticias nuevas -> Estado ANORMAL
+INTERVALO_CICLO_NOTICIAS_SEG = 30          # Sondeo continuo de las 6 secciones de analisis.py
+INTERVALO_CICLO_INDICADORES_SEG = 45       # Descarga vectorizada por lotes en scanner.py
+UMBRAL_LATENCIA_NOTICIAS_ADVERTENCIA = 240 # 4 min sin eventos nuevos -> Estado VIGILANCIA
+UMBRAL_LATENCIA_NOTICIAS_ANORMAL = 480     # 8 min sin eventos nuevos -> Estado ANORMAL
 
-# Umbrales de filtrado técnico e IA
-UMBRAL_POTENCIAL_DATOS_TERMINAL = 62.0     # Score mínimo (0-100) para mostrar en terminal /datos
-UMBRAL_CERTEZA_EVENTO_TECNICO = 60.0       # Certeza mínima técnica (%) para considerar evento fuerte
-UMBRAL_CERTEZA_AI_OPERACION = 65.0         # Certeza mínima IA (%) para ejecutar compra/venta
-UMBRAL_CERTEZA_AI_ROTACION_PERDIDA = 84.0  # Certeza mínima IA (%) para liquidar posición en pérdida por rotación
+# Umbrales de filtrado técnico e IA (más selectivos: cero day-trading por ruido)
+UMBRAL_POTENCIAL_DATOS_TERMINAL = 64.0     # Score mínimo (0-100) para mostrar en terminal /d
+UMBRAL_CERTEZA_EVENTO_TECNICO = 62.0       # Certeza mínima técnica (%) para acumular pilar en Smart Gatekeeper
+UMBRAL_CERTEZA_AI_OPERACION = 68.0         # Certeza mínima IA (%) para ejecutar compra/venta
+UMBRAL_CERTEZA_AI_ROTACION_PERDIDA = 85.0  # Certeza mínima IA (%) para liquidar posición en pérdida por rotación
 
-# Mitigación de consultas innecesarias y método de consulta múltiple
-COOLDOWN_CONSULTA_TICKER_SEG = 150         # Cooldown base estándar entre análisis del mismo ticker
-COOLDOWN_NEUTRAL_EXTENDIDO_SEG = 450       # Cooldown ampliado si el modelo dictaminó NEUTRAL
-MAX_CONSULTAS_AI_POR_MINUTO = 8            # Tope global de llamadas API por minuto (en lotes multi-ticker)
+# Mitigación agresiva de consultas innecesarias y método de consulta múltiple
+COOLDOWN_CONSULTA_TICKER_SEG = 1500        # 25 min mínimo estándar entre consultas al mismo ticker
+COOLDOWN_NEUTRAL_EXTENDIDO_SEG = 2400      # 40+ min tras dictamen NEUTRAL
+MAX_CONSULTAS_AI_POR_MINUTO = 3            # Tope estricto por minuto
+MAX_CONSULTAS_AI_POR_HORA_FLEXIBLE = 20    # Tope horario en ventanas flexibles
+MAX_CONSULTAS_AI_POR_HORA_ESTRICTA = 10    # Tope horario en ventanas estrictas
 MAX_ASIGNACION_POR_POSICION_PCT = 25.0     # Máximo % de la cartera en una sola posición estándar
 
-MIN_TICKERS_LOTE_AI = 2                    # Agrupa al menos 2 empresas cuando existan señales próximas
+MIN_TICKERS_LOTE_AI = 2                    # Priorizar agrupación de 2+ empresas relacionadas
 MAX_TICKERS_LOTE_AI = 6                    # Máximo de empresas evaluadas simultáneamente en una consulta IA
-VENTANA_AGRUPACION_LOTE_SEG = 3.5          # Ventana para acumular candidatos interrelacionados antes de enviar lote
+VENTANA_AGRUPACION_LOTE_SEG = 18.0         # Ventana base para acumular evidencia multi-señal y agrupar lotes

@@ -39,31 +39,31 @@ from config import (
 # Contenido base de respaldo en caso de que AGENTS.md haya sido eliminado manualmente
 PLANTILLA_RESPALDO_AGENTS_MD = """# AGENTS.md — Contexto y Reglas de Arquitectura del Proyecto VAGY-M1
 
-Sistema modular en Python para monitoreo bursátil multi-terminal (4 cuadrantes), análisis cuantitativo vectorizado, vigilancia continua de noticias/macroeconomía y toma de decisiones porcentuales sobre cartera virtual con IA (**Método de Consulta Múltiple por Lotes Sectoriales**: Gemini Flash 3.6/3.7/3.8, Argon, Hydrogen, Carbon, Pro 3.1 y Claude Sonnet/Opus/Fable con niveles de esfuerzo configurables).
+Sistema modular en Python para monitoreo bursátil multi-terminal (4 cuadrantes), escaneo cuantitativo vectorizado, análisis informativo multi-fuente en 6 secciones y toma de decisiones porcentuales sobre cartera virtual con IA (**Método de Consulta Múltiple por Lotes Sectoriales**: Gemini Flash 3.6/3.7/3.8, Argon, Hydrogen, Carbon, Pro 3.1 y Claude Sonnet/Opus/Fable con telemetría de tokens y costo USD).
 
 ## Módulos Principales
-- `main.py`: Orquestador principal, asistente de inicio (10 modelos + esfuerzos), interfaz TUI de 4 zonas con `GestorComandosInteractivos` no bloqueante (flechas/Tab/historial/Ctrl+V), comandos interactivos (`/v`, `/n`, `/d`, `/pausar`, `/reanudar`, `/modelo`, `/lote`, `/apikey`, `/help`, `/quit`), leyendas `Supervisión AI` (morado) y `Supervisión Noticias` (azul), y gestión de cierre (`/quit` 1: MyM, 2: Progresivo, 3: Inmediato + Ctrl+C limpio).
-- `infomarket.py`: Descarga histórica inicial (2 días) y monitoreo continuo RSS (específicas, macro Fed/tasas/geopolítica y sectoriales tecnología/semiconductores/IA/RAM/finanzas/salud/consumo) + Yahoo Finance API con salud/latencia, marca temporal de captura (`epoch_captura`), extracción por rango offline (`obtener_noticias_en_rango`) y armado de contexto por lotes (`obtener_contexto_lote`).
-- `indicadores.py` (`datos_indicadores.py`): Fundamentales y 13 indicadores técnicos/flujo institucional/volumen real con filtro de certeza y snapshots globales para evaluación multi-empresa.
-- `analisis_ai.py`: Smart Gatekeeper con confluencia multi-señal (`indicadores + noticias`), propagación sectorial interrelacionada, sensibilidad por horario de mercado ET (`America/New_York`), consulta múltiple en una sola llamada (`DecisionLoteModeloIA`), modo offline (`/pausar`/`/reanudar` manteniendo flujos locales activos, espera post-reanudación hasta evento alcista/bajista e inyección del marco de contexto de interrupción sección D), integración `google-genai` (`client.interactions.create` + `thinking_level`) y Anthropic `v1/messages` (`output_config.effort`).
+- `main.py`: Orquestador principal, asistente de inicio (10 modelos + esfuerzos), interfaz TUI de 4 zonas con `GestorComandosInteractivos` no bloqueante, comandos interactivos (`/v`, `/n`, `/d`, `/pausar`, `/reanudar`, `/modelo`, `/lote`, `/apikey`, `/help`, `/quit`), leyendas `Supervisión AI` (morado, con tokens/consulta, acumulados y costo USD) y `Supervisión Noticias` (azul).
+- `analisis.py`: Motor de análisis de información dividido en **6 secciones**: (1) `NOTICIAS`, (2) `FILINGS_8K` (SEC EDGAR + `yfinance`), (3) `REPORTES_RESULTADOS` (evaluación conjunta con `scanner.py`: fecha próximo reporte, ingresos/EPS esperados vs reportados), (4) `DIVULGACIONES_CONGRESO` (6 categorías oficiales: Ingresos ganados/no ganados, Activos/propiedades, Deudas/pasivos, Regalos/viajes, Cargos externos/acuerdos, Finanzas familiares), (5) `FED` (tasas, FOMC, CPI/PCE) y (6) `MACROECONOMIA` (avances en otros países, tensión geopolítica, movimientos bélicos).
+- `scanner.py` (`datos_indicadores.py`): Descarga vectorizada por lotes y análisis técnico/cuantitativo con flujo de volumen real (`RVOL`, `OBV`, `CMF`), 17 indicadores incluyendo **Rupturas de Rango de Apertura (ORB)**, **Patrones Bandera**, **Rebotes por Sobreventa / Rechazos**, **Tendencia Diaria SMA20/50 + Squeeze**, y extracción de **Reportes de Resultados** (`fecha_proximo_reporte`, `ingresos_esperados`, `ingresos_reportados`).
+- `analisis_ai.py`: Smart Gatekeeper anti-day-trading con matriz multi-pilar, sensibilidad por horario ET (`09:15-09:30` pre-market, `09:30-09:50` apertura y `15:45-16:00` cierre flexibles; estricto en cualquier otro horario exigiendo combinación de pilares), consulta múltiple en una sola llamada (`DecisionLoteModeloIA`) y contabilidad de tokens/costo USD.
 - `cartera.py`: Gestor de cartera virtual porcentual (`spot` vs `short y long`) y rotación por certeza.
 - `terminales.py`: Ventanas secundarias dependientes (`/v`, `/n`, `/d`) lanzadas en cuadrantes sin robo de foco (`SW_SHOWNOACTIVATE`) y sin redimensionar Windows Terminal (`CASCADIA_HOSTING_WINDOW_CLASS`).
-- `historial.py` y `config.py`: Limpieza automática hacia `hystmp/`, bus IPC en `.sesion_activa/`, catálogos de modelos/sectores/horarios y restauración segura de consola VT/Win32 al salir.
+- `historial.py` y `config.py`: Limpieza automática integral de residuos (`__pycache__`, `.md` de resumen, `.csv`, `.json`, `.sesion_activa/`) hacia `hystmp/`, bus IPC y catálogos/tarifas.
 
-## Reglas Esenciales para Agentes (Gemini Argon/Carbon/Hydrogen/Pro & Claude Sonnet/Opus/Fable)
+## Reglas Esenciales para Agentes
 1. Mantener toda operación de cartera en base porcentual (`%` del patrimonio).
 2. En Gemini usar exclusivamente `from google import genai` y `client.interactions.create(...)` con `generation_config={"thinking_level": ...}`, sin `temperature`/`top_p`/`top_k` ni `thinking_budget`.
-3. Respetar los colores ANSI exactos: nunca colorear los corchetes `[` `]` alrededor de `[ticker]`, usar leyenda morada para `Supervisión AI` (mostrando todos los tickers del lote) y leyenda azul para `Supervisión Noticias`.
+3. Respetar los colores ANSI exactos: nunca colorear los corchetes `[` `]` alrededor de `[ticker]`, usar leyenda morada para `Supervisión AI` y leyenda azul para `Supervisión Noticias`.
 4. Nunca redimensionar la ventana padre de Windows Terminal (`CASCADIA_HOSTING_WINDOW_CLASS`) ni desactivar `ENABLE_VIRTUAL_TERMINAL_INPUT` (`0x0200`).
-5. Nunca mover ni borrar archivos `.py` ni `.md` durante la rotación de historial hacia `hystmp/`.
+5. Al iniciar sesión, mover todo residuo (`__pycache__`, `.sesion_activa/`, `resumen_sesion_*`, `.csv`, `.json`, `.log`, `.tmp`, `.bak`) a `hystmp/` protegiendo scripts `.py`, documentación canónica (`AGENTS.md`, `README.md`) y `hystmp/`.
 """
 
 
 class GestorHistorial:
     """Administra limpieza inicial (`hystmp`), IPC de sesión activa y guardado de reportes finales."""
 
-    # Extensiones y nombres que NUNCA deben moverse a hystmp
-    EXTENSIONES_PROTEGIDAS = {".py", ".md", ".toml", ".cfg", ".ini", ".bat", ".ps1"}
+    # Extensiones de código y configuración que NUNCA deben moverse a hystmp
+    EXTENSIONES_PROTEGIDAS = {".py", ".toml", ".cfg", ".ini", ".bat", ".ps1", ".yaml", ".yml"}
     NOMBRES_PROTEGIDOS = {
         "AGENTS.md",
         "GEMINI.md",
@@ -73,12 +73,33 @@ class GestorHistorial:
         ".gitignore",
         ".env",
         NOMBRE_DIR_HYSTMP,
-        "__pycache__",
+        "old",
         ".git",
         ".agents",
         ".agent",
         "venv",
         ".venv",
+    }
+    CARPETAS_RESIDUALES = {
+        NOMBRE_DIR_SESION_ACTIVA,
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        "tmp",
+        "logs",
+    }
+    EXTENSIONES_RESIDUALES = {
+        ".log",
+        ".tmp",
+        ".jsonl",
+        ".csv",
+        ".json",
+        ".bak",
+        ".pyc",
+        ".pyo",
+        ".md",
+        ".txt",
     }
 
     def __init__(self, directorio_base: Optional[ str | Path ] = None) -> None:
@@ -103,8 +124,10 @@ class GestorHistorial:
         """
         Ejecuta la rutina de inicio limpio:
         1. Asegura la existencia del directorio `hystmp/`.
-        2. Detecta archivos/carpetas residuales de ejecuciones previas y los mueve a
-           `hystmp/sesion_previa_<timestamp>/` sin tocar scripts (.py) ni archivos .md.
+        2. Detecta archivos y carpetas residuales de ejecuciones previas (`__pycache__`,
+           `.sesion_activa/`, `resumen_sesion_*.md/.json`, `historial_posiciones_*.csv`,
+           logs, temporales, etc.) y los mueve a `hystmp/sesion_previa_<timestamp>/`
+           protegiendo estrictamente scripts `.py` y documentación canónica (`AGENTS.md`, `README.md`).
         3. Verifica que `AGENTS.md` exista con el formato correcto.
         4. Inicializa un directorio `.sesion_activa/` limpio para la nueva ejecución.
         """
@@ -113,10 +136,10 @@ class GestorHistorial:
         marca_tiempo = datetime.now().strftime("%Y%m%d_%H%M%S")
         destino_lote: Optional[Path] = None
 
-        for item in self.base_dir.iterdir():
+        for item in list(self.base_dir.iterdir()):
             nombre = item.name
 
-            # Proteger scripts, markdowns, entornos y la propia carpeta hystmp
+            # Proteger archivos/carpetas canónicos del proyecto y entornos virtuales
             if nombre in self.NOMBRES_PROTEGIDOS:
                 continue
             if item.is_file() and item.suffix.lower() in self.EXTENSIONES_PROTEGIDAS:
@@ -126,25 +149,42 @@ class GestorHistorial:
 
             # Identificar si es residuo/historial de una sesión anterior
             es_residuo = (
-                nombre == NOMBRE_DIR_SESION_ACTIVA
+                nombre in self.CARPETAS_RESIDUALES
                 or nombre.startswith("resumen_sesion_")
                 or nombre.startswith("historial_posiciones_")
                 or nombre.startswith("sesion_")
-                or item.suffix.lower() in {".log", ".tmp", ".jsonl", ".csv", ".json", ".bak"}
+                or nombre.startswith("reporte_")
+                or (item.is_file() and item.suffix.lower() in self.EXTENSIONES_RESIDUALES)
             )
 
             if es_residuo:
                 if destino_lote is None:
                     destino_lote = self.hystmp_dir / f"sesion_previa_{marca_tiempo}"
                     destino_lote.mkdir(parents=True, exist_ok=True)
+                destino_final = destino_lote / nombre
+                if destino_final.exists():
+                    destino_final = destino_lote / f"{nombre}_{int(time.time() * 1000) % 10000}"
                 try:
-                    destino_final = destino_lote / nombre
                     shutil.move(str(item), str(destino_final))
                     movidos.append(nombre)
                 except Exception:
-                    # Si algún archivo estuviera bloqueado temporalmente, si es carpeta limpia su interior
-                    if item.is_dir() and nombre == NOMBRE_DIR_SESION_ACTIVA:
-                        shutil.rmtree(item, ignore_errors=True)
+                    # En Windows, si algún subarchivo de __pycache__/.sesion_activa estuviera ocupado,
+                    # intentamos mover archivo por archivo y limpiar lo sobrante.
+                    if item.is_dir():
+                        try:
+                            destino_final.mkdir(parents=True, exist_ok=True)
+                            alg_movido = False
+                            for sub in list(item.iterdir()):
+                                try:
+                                    shutil.move(str(sub), str(destino_final / sub.name))
+                                    alg_movido = True
+                                except Exception:
+                                    pass
+                            if alg_movido:
+                                movidos.append(f"{nombre}/*")
+                            shutil.rmtree(item, ignore_errors=True)
+                        except Exception:
+                            pass
 
         agents_creado = self.asegurar_agents_md()
 
@@ -305,15 +345,17 @@ class GestorHistorial:
             f"- **Total Operaciones Cerradas**: `{resumen_datos.get('operaciones_cerradas', 0)}`",
             f"- **Tasa de Acierto (Win Rate)**: `{resumen_datos.get('win_rate_pct', 0.0):.1f}%`",
             "",
-            "## 3. Estadísticas del Supervisor de Agente IA y Noticias",
+            "## 3. Estadísticas del Supervisor de Agente IA, Tokens y Costo",
             f"- **Total Consultas (Lotes) a IA**: `{resumen_datos.get('ai_total_consultas', 0)}` (`{resumen_datos.get('ai_activos_evaluados', 0)}` empresas evaluadas)",
+            f"- **Tokens Acumulados**: `{resumen_datos.get('ai_tokens_total', 0):,}` (Input: `{resumen_datos.get('ai_tokens_input', 0):,}` | Output: `{resumen_datos.get('ai_tokens_output', 0):,}` | Thought: `{resumen_datos.get('ai_tokens_thought', 0):,}` | Cache: `{resumen_datos.get('ai_tokens_cached', 0):,}`)",
+            f"- **Costo Estimado Total IA**: `${resumen_datos.get('ai_costo_total_usd', 0.0):.5f} USD`",
             f"- **Consultas Ahorradas (Agrupación Lotes / Gatekeeper)**: `{resumen_datos.get('ai_consultas_ahorradas_lote', 0)}` por lote / `{resumen_datos.get('ai_consultas_filtradas', 0)}` filtradas",
             f"- **Predicciones Alcistas (Compra/Long)**: `{resumen_datos.get('ai_alcistas', 0)}`",
             f"- **Predicciones Bajistas (Venta/Short)**: `{resumen_datos.get('ai_bajistas', 0)}`",
             f"- **Respuestas Neutrales (Descartadas)**: `{resumen_datos.get('ai_neutrales', 0)}`",
             f"- **Pausas IA (Modo Offline)**: `{resumen_datos.get('ai_pausas_offline', 0)}`",
             f"- **Fallos de Conexión / Fondos IA**: `{resumen_datos.get('ai_errores', 0)}`",
-            f"- **Total Noticias Procesadas**: `{resumen_datos.get('total_noticias', 0)}`",
+            f"- **Total Eventos Informativos Procesados**: `{resumen_datos.get('total_noticias', 0)}`",
             "",
             f"> Historial detallado de posiciones guardado en: `{ruta_historial_csv.name}`",
         ]

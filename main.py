@@ -5,8 +5,9 @@ main.py
 Orquestador principal del proyecto VAGY-M1.
 
 Responsabilidades:
-1. Higiene inicial del espacio de trabajo (`historial.py` -> mueve residuos previos a `hystmp/`
-   sin tocar scripts `.py` ni documentos `.md`, y garantiza `AGENTS.md`).
+1. Higiene integral inicial del espacio de trabajo (`historial.py` -> mueve TODOS los residuos previos
+   como `__pycache__`, `resumen_sesion_*.md/.json`, `historial_posiciones_*.csv`, `.sesion_activa/`, etc.
+   hacia `hystmp/`, protegiendo scripts `.py` y documentación canónica como `AGENTS.md`).
 2. Menú interactivo de inicialización ampliado:
    - Modelo de IA (`flash3.6`, `flash3.7`, `flash3.8`, `argon`, `hydrogen`, `carbon`,
      `pro3.1`, `sonnet`, `opus`, `fable`)
@@ -17,9 +18,10 @@ Responsabilidades:
    - Resumen completo de configuración inicial
 3. Apertura automática sin robo de foco de las 3 terminales secundarias (`/v`, `/n`, `/d`).
 4. Interfaz principal TUI rediseñada de 4 zonas con comandos interactivos instantáneos:
-   - Zona 1 (Superior desplazable): Solo hallazgos de alto potencial (alcista/bajista).
-   - Zona 2 (Antepenúltima línea): Leyenda `Supervisión AI` en morado + métricas, errores y tickers por consulta.
-   - Zona 3 (Penúltima línea): Leyenda `Supervisión Noticias` en azul + salud, hora AM/PM, `[ticker]`, fuente.
+   - Zona 1 (Superior desplazable): Solo hallazgos de alto potencial (alcista/bajista), con tokens y costo USD.
+   - Zona 2 (Antepenúltima línea): Leyenda `Supervisión AI` en morado + métricas, tokens/consulta y acumulados,
+     costo USD, errores y tickers por consulta.
+   - Zona 3 (Penúltima línea): Leyenda `Supervisión Noticias` en azul + salud, hora AM/PM, `[ticker]`, fuente/sección.
    - Zona 4 (Última línea): Consola interactiva asíncrona con historial (`↑↓`), autocompletado (`Tab`),
      pegado (`Ctrl+V`) y edición en línea (incluye `/pausar` y `/reanudar` modo offline IA).
 """
@@ -36,9 +38,13 @@ import threading
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+sys.dont_write_bytecode = True
+os.environ.setdefault("PYTHONDONTWRITEBYTECODE", "1")
+
 if os.name == "nt":
     import msvcrt
 
+from analisis import EventoAnalisis, GestorAnalisisMercado
 from analisis_ai import (
     AnalizadorAI,
     EventoImpresionPrincipal,
@@ -47,6 +53,7 @@ from analisis_ai import (
 )
 from cartera import CarteraVirtual
 from config import (
+    ETIQUETAS_SECCIONES_ANALISIS,
     LISTA_ACCIONES_1,
     LISTA_ACCIONES_2,
     MODELOS_IA_DISPONIBLES,
@@ -70,8 +77,7 @@ from config import (
     ticker_morado,
 )
 from historial import GestorHistorial
-from indicadores import GestorIndicadores
-from infomarket import GestorInfoMarket
+from scanner import ScannerMercado, formatear_monto_compacto
 from terminales import GestorTerminalesSecundarias
 
 
@@ -416,7 +422,7 @@ class ConsolaCuatroZonas:
                 ancho,
             )
 
-            # 2. Antepenúltima línea (rows - 2): Supervisión AI (morado) + tickers por consulta
+            # 2. Antepenúltima línea (rows - 2): Supervisión AI (morado) + tokens/costo USD + tickers por consulta
             tot_c = int(stats_ai.get("total_consultas", 0))
             tot_ev = int(stats_ai.get("total_activos_evaluados", 0))
             alc = int(stats_ai.get("alcistas", 0))
@@ -428,6 +434,31 @@ class ConsolaCuatroZonas:
             est_ag = str(stats_ai.get("estado_agente", "LISTO"))
             err_con = int(stats_ai.get("fallos_conexion", 0))
             err_fon = int(stats_ai.get("fallos_fondos", 0))
+
+            tok_ult = int(stats_ai.get("tokens_ultima_total", 0) or 0)
+            tok_ac = int(stats_ai.get("tokens_acum_total", 0) or 0)
+            costo_ult = float(stats_ai.get("costo_ultima_usd", 0.0) or 0.0)
+            costo_ac = float(stats_ai.get("costo_acumulado_usd", 0.0) or 0.0)
+
+            def _fmt_tok(v: int) -> str:
+                if v >= 1_000_000:
+                    return f"{v / 1_000_000:.2f}M"
+                if v >= 1_000:
+                    return f"{v / 1_000:.1f}k"
+                return str(max(0, v))
+
+            def _fmt_usd(c: float) -> str:
+                v = max(0.0, float(c))
+                if v == 0.0:
+                    return "$0.00"
+                if v < 0.01:
+                    return f"${v:.4f}"
+                if v < 1.0:
+                    return f"${v:.3f}"
+                return f"${v:.2f}"
+
+            tok_str = f"{_fmt_tok(tok_ult)}/{_fmt_tok(tok_ac)}"
+            usd_str = f"{_fmt_usd(costo_ult)}/{_fmt_usd(costo_ac)}"
 
             ult_tks: List[str] = list(stats_ai.get("ultimos_tickers_consulta", []))
             cola_tks: List[str] = list(stats_ai.get("tickers_cola", []))
@@ -452,27 +483,31 @@ class ConsolaCuatroZonas:
                 color_est_ai = Colores.VERDE
 
             alerta_extra = f" | Err:{err_con + err_fon}" if (err_con > 0 or err_fon > 0) else ""
-            ley_ai = leyenda_supervision_ai(compacta=(self._cols < 74))
+            ley_ai = leyenda_supervision_ai(compacta=(self._cols < 86))
 
-            if self._cols >= 134:
+            if self._cols >= 152:
                 raw_sup_ai = (
                     f"{ley_ai}{Colores.BG_SUPERVISOR_AI} "
                     f"Cons:{Colores.BLANCO}{tot_c}({tot_ev}ev){Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
                     f"Alza:{Colores.VERDE}{alc}({alc_p:.0f}%){Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
                     f"Baja:{Colores.ROJO}{baj}({baj_p:.0f}%){Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
                     f"Neu:{Colores.AMARILLO}{neu}({neu_p:.0f}%){Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
+                    f"Tok:{Colores.CIAN}{tok_str}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} "
+                    f"({Colores.VERDE}{usd_str}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}) | "
                     f"{color_est_ai}{est_ag}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}{alerta_extra} | "
                     f"Emp:[{Colores.CIAN}{tks_render}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}]{Colores.RESET}"
                 )
             else:
-                est_comp = "ESPERANDO ALZA/BAJA" if est_ag == "ESPERANDO EVENTO ALZA/BAJA" else est_ag
+                est_comp = "ESP.ALZA/BAJA" if est_ag == "ESPERANDO EVENTO ALZA/BAJA" else est_ag
                 raw_sup_ai = (
                     f"{ley_ai}{Colores.BG_SUPERVISOR_AI} "
                     f"C:{Colores.BLANCO}{tot_c}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} "
                     f"▲{Colores.VERDE}{alc}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} "
                     f"▼{Colores.ROJO}{baj}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} "
                     f"={Colores.AMARILLO}{neu}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
-                    f"{color_est_ai}{self._recortar_visible(est_comp, 20)}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}{alerta_extra} | "
+                    f"Tok:{Colores.CIAN}{tok_str}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} "
+                    f"{Colores.VERDE}{usd_str}{Colores.RESET}{Colores.BG_SUPERVISOR_AI} | "
+                    f"{color_est_ai}{self._recortar_visible(est_comp, 16)}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}{alerta_extra} | "
                     f"[{Colores.CIAN}{tks_render}{Colores.RESET}{Colores.BG_SUPERVISOR_AI}]{Colores.RESET}"
                 )
             linea_sup_ai = recortar_ansi_visible(raw_sup_ai, ancho)
@@ -484,6 +519,9 @@ class ConsolaCuatroZonas:
             seg_ult = int(sup_noticias.get("segundos_desde_ultima", 0))
             tk_ult = str(sup_noticias.get("ultimo_ticker", "-"))
             plat_ult = self._recortar_visible(str(sup_noticias.get("ultima_plataforma", "")), 14)
+            sec_ult = str(sup_noticias.get("ultima_seccion", "")).strip()
+            sec_lbl = ETIQUETAS_SECCIONES_ANALISIS.get(sec_ult, sec_ult)
+            sec_tag = f" ({self._recortar_visible(sec_lbl, 12)})" if (sec_lbl and self._cols >= 122) else ""
             tot_not = int(sup_noticias.get("total_noticias", 0))
             f_ok = int(sup_noticias.get("fuentes_ok", 0))
             f_tot = int(sup_noticias.get("fuentes_total", 0))
@@ -495,13 +533,13 @@ class ConsolaCuatroZonas:
             else:
                 col_not = Colores.ROJO
 
-            ley_not = leyenda_supervision_noticias(compacta=(self._cols < 74))
+            ley_not = leyenda_supervision_noticias(compacta=(self._cols < 86))
             raw_sup_not = (
                 f"{ley_not}{Colores.BG_SUPERVISION_NEWS} "
                 f"{col_not}{est_not}{Colores.RESET}{Colores.BG_SUPERVISION_NEWS} | "
                 f"{Colores.BLANCO}{hora_ult}{Colores.RESET}{Colores.BG_SUPERVISION_NEWS} ({seg_ult}s) | "
-                f"{ticker_azul(tk_ult)}{Colores.BG_SUPERVISION_NEWS}, {plat_ult} | "
-                f"Not:{tot_not} OK:{f_ok}/{f_tot}{Colores.RESET}"
+                f"{ticker_azul(tk_ult)}{Colores.BG_SUPERVISION_NEWS}, {plat_ult}{sec_tag} | "
+                f"Ev:{tot_not} OK:{f_ok}/{f_tot}{Colores.RESET}"
             )
             linea_sup_not = recortar_ansi_visible(raw_sup_not, ancho)
 
@@ -812,11 +850,12 @@ def formatear_bloque_alto_potencial(ev: EventoImpresionPrincipal) -> str:
     Construye el bloque exacto requerido para la Zona 1 de la terminal principal cuando
     `analisis_ai` responde que la acción tiene alto potencial alcista o bajista:
     -> Fecha y hora (con segs AM/PM) | [ticker en morado] | predicción (alcista en verde / bajista en rojo)
+    -> Tokens y costo USD de la consulta (si aplica)
     -> Prompt que se le envía al modelo
     -> Respuesta del modelo
-    -> (Noticias analizadas) Fecha y hora (AM/PM) | [ticker en azul] | plataforma (verde pos / rojo neg) | link
-    -> Datos financieros de la empresa (precio, P/E, soporte y resistencia, etc.)
-    -> Indicadores
+    -> Eventos informativos de 6 secciones (`analisis.py`)
+    -> Datos financieros + Reporte de resultados conjunto (`scanner.py`)
+    -> Indicadores y Patrones Swing Detectados
     """
     pred_upper = ev.prediccion_movimiento.strip().upper()
     if pred_upper == "ALCISTA":
@@ -838,6 +877,14 @@ def formatear_bloque_alto_potencial(ev: EventoImpresionPrincipal) -> str:
     lineas.append(f"{Colores.MORADO}{'═' * 94}{Colores.RESET}")
     lineas.append(f"-> {ev.fecha_hora_ampm} | {ticker_morado(ev.ticker)} | {pred_coloreada}")
 
+    if ev.tokens_consulta_total > 0 or ev.costo_consulta_usd > 0.0:
+        lineas.append(
+            f"-> {Colores.CIAN}{Colores.BOLD}Tokens y Costo Consulta:{Colores.RESET} "
+            f"{Colores.CIAN}{ev.tokens_consulta_total:,} tok{Colores.RESET} "
+            f"(In:{ev.tokens_consulta_input:,} | Out:{ev.tokens_consulta_output:,} | Think:{ev.tokens_consulta_thought:,}) | "
+            f"Costo: {Colores.VERDE}${ev.costo_consulta_usd:.5f} USD{Colores.RESET}"
+        )
+
     lineas.append(f"-> {Colores.CIAN}{Colores.BOLD}Prompt enviado al modelo:{Colores.RESET}")
     for ln_p in ev.prompt_enviado.splitlines():
         lineas.append(f"   {Colores.GRIS}{ln_p}{Colores.RESET}")
@@ -846,11 +893,20 @@ def formatear_bloque_alto_potencial(ev: EventoImpresionPrincipal) -> str:
     for ln_r in ev.respuesta_modelo_texto.splitlines():
         lineas.append(f"   {Colores.BLANCO}{ln_r}{Colores.RESET}")
 
-    lineas.append(f"-> {Colores.CIAN}{Colores.BOLD}Noticias analizadas:{Colores.RESET}")
+    lineas.append(f"-> {Colores.CIAN}{Colores.BOLD}Noticias y eventos analizados (6 secciones):{Colores.RESET}")
     if ev.noticias_analizadas:
         for n in ev.noticias_analizadas:
             plat_col = colorear_plataforma_noticia(n.plataforma, n.sentimiento)
-            lineas.append(f"   {n.fecha_hora_ampm} | {ticker_azul(n.ticker)} | {plat_col} | {n.link}")
+            sec_cod = getattr(n, "seccion", "")
+            sec_lbl = ETIQUETAS_SECCIONES_ANALISIS.get(sec_cod, sec_cod)
+            sub_lbl = getattr(n, "subcategoria", "")
+            if sec_lbl and sub_lbl:
+                tag_sec = f" {Colores.GRIS}({sec_lbl} - {sub_lbl}){Colores.RESET}"
+            elif sec_lbl:
+                tag_sec = f" {Colores.GRIS}({sec_lbl}){Colores.RESET}"
+            else:
+                tag_sec = ""
+            lineas.append(f"   {n.fecha_hora_ampm} | {ticker_azul(n.ticker)} | {plat_col}{tag_sec} | {n.link}")
     else:
         lineas.append(f"   {Colores.GRIS}(Análisis impulsado por ruptura cuantitativa / estructura técnica){Colores.RESET}")
 
@@ -862,6 +918,34 @@ def formatear_bloque_alto_potencial(ev: EventoImpresionPrincipal) -> str:
         f"Resistencia=${df.resistencia_1:.2f}/${df.resistencia_2:.2f} | "
         f"VWAP=${df.vwap_sesion:.2f} | Rango 52s={r52}"
     )
+
+    rep = getattr(df, "reporte_resultados", None)
+    if rep is not None:
+        prox_txt = rep.fecha_proximo_reporte or "N/D"
+        if rep.dias_hasta_reporte is not None:
+            prox_txt = f"{prox_txt} ({rep.dias_hasta_reporte}d)"
+        ing_esp = formatear_monto_compacto(rep.ingresos_esperados)
+        ing_rep = formatear_monto_compacto(rep.ingresos_reportados)
+        yoy_txt = (
+            f" ({rep.ingresos_crecimiento_yoy_pct:+.1f}% YoY)"
+            if rep.ingresos_crecimiento_yoy_pct is not None
+            else ""
+        )
+        eps_txt = ""
+        if rep.eps_reportado is not None and rep.eps_esperado is not None:
+            sorp_t = f" ({rep.eps_sorpresa_pct:+.1f}%)" if rep.eps_sorpresa_pct is not None else ""
+            eps_txt = f" | EPS={rep.eps_reportado:.2f} vs {rep.eps_esperado:.2f}{sorp_t}"
+        lineas.append(
+            f"-> {Colores.CIAN}{Colores.BOLD}Reporte Resultados (Scanner):{Colores.RESET} "
+            f"Próx={prox_txt} | Ing.Esp={ing_esp} | Ing.Rep={ing_rep}{yoy_txt}{eps_txt} | Eval={rep.evaluacion_reporte}"
+        )
+
+    patrones = getattr(ev.analisis_tecnico, "patrones_detectados", None) or []
+    if patrones:
+        lineas.append(
+            f"-> {Colores.CIAN}{Colores.BOLD}Patrones Swing Detectados:{Colores.RESET} "
+            f"{Colores.AMARILLO}{', '.join(patrones)}{Colores.RESET}"
+        )
 
     lineas.append(
         f"-> {Colores.CIAN}{Colores.BOLD}Indicadores (Evaluación General: "
@@ -945,10 +1029,10 @@ def ejecutar_asistente_inicializacion(info_limpieza: Dict) -> Dict[str, Any]:
     if movidos:
         print(
             f"{Colores.AMARILLO}[Historial Limpio]{Colores.RESET} Se archivaron {len(movidos)} elemento(s) "
-            f"previos en `{Colores.CIAN}hystmp/{Colores.RESET}`."
+            f"residuales previos (__pycache__, .md/.csv/.json, logs) en `{Colores.CIAN}hystmp/{Colores.RESET}`."
         )
     else:
-        print(f"{Colores.VERDE}[Historial Limpio]{Colores.RESET} Espacio de trabajo verificado y `AGENTS.md` activo.")
+        print(f"{Colores.VERDE}[Historial Limpio]{Colores.RESET} Espacio de trabajo limpio y `AGENTS.md` activo.")
 
     # 1 y 2. Modelo + Esfuerzo + API Key verificada en vivo
     modelo_elegido = "flash3.8"
@@ -1099,7 +1183,7 @@ def ejecutar_asistente_inicializacion(info_limpieza: Dict) -> Dict[str, Any]:
         f"  • Modelo de IA        : {Colores.MORADO}{Colores.BOLD}{meta_final['nombre_mostrar']}{Colores.RESET} "
         f"({meta_final['model_id']}) | Esfuerzo: {Colores.CIAN}{esfuerzo_elegido}{Colores.RESET}"
     )
-    print(f"  • Método de Consulta  : {Colores.CIAN}Consulta Múltiple por Lotes Sectoriales + Confluencia Horaria{Colores.RESET} [{reg_inicial['etiqueta']}]")
+    print(f"  • Método de Consulta  : {Colores.CIAN}6 Secciones (analisis.py) + Scanner 17 Ind. | Anti-Day-Trading ET{Colores.RESET} [{reg_inicial['etiqueta']}]")
     print(f"  • API Key             : {key_mask} [{estado_key_res}]")
     print(f"  • Tipo de Operación   : {Colores.CIAN}{etiqueta_modo}{Colores.RESET}")
     print(f"  • Lista de Acciones   : {Colores.AZUL}{lista_nombre}{Colores.RESET} ({len(tickers_sel)} tickers activos)")
@@ -1130,7 +1214,7 @@ def ejecutar_asistente_inicializacion(info_limpieza: Dict) -> Dict[str, Any]:
 def _construir_y_exportar_reportes_finales(
     config_sesion: Dict[str, Any],
     nombre_cierre: str,
-    infomarket: GestorInfoMarket,
+    analisis_mkt: GestorAnalisisMercado,
     cartera: CarteraVirtual,
     analizador_ai: AnalizadorAI,
     historial: GestorHistorial,
@@ -1157,6 +1241,12 @@ def _construir_y_exportar_reportes_finales(
         "win_rate_pct": snap_final["win_rate_pct"],
         "ai_total_consultas": stats_ai["total_consultas"],
         "ai_activos_evaluados": stats_ai["total_activos_evaluados"],
+        "ai_tokens_input": int(stats_ai.get("tokens_acum_input", 0) or 0),
+        "ai_tokens_output": int(stats_ai.get("tokens_acum_output", 0) or 0),
+        "ai_tokens_thought": int(stats_ai.get("tokens_acum_thought", 0) or 0),
+        "ai_tokens_cached": int(stats_ai.get("tokens_acum_cached", 0) or 0),
+        "ai_tokens_total": int(stats_ai.get("tokens_acum_total", 0) or 0),
+        "ai_costo_total_usd": float(stats_ai.get("costo_acumulado_usd", 0.0) or 0.0),
         "ai_consultas_ahorradas_lote": stats_ai["ahorradas_lote"],
         "ai_consultas_filtradas": stats_ai["filtradas_gatekeeper"],
         "ai_alcistas": stats_ai["alcistas"],
@@ -1164,7 +1254,7 @@ def _construir_y_exportar_reportes_finales(
         "ai_neutrales": stats_ai["neutrales"],
         "ai_pausas_offline": stats_ai.get("total_pausas", 0),
         "ai_errores": int(stats_ai["fallos_conexion"]) + int(stats_ai["fallos_fondos"]),
-        "total_noticias": infomarket.total_noticias_capturadas(),
+        "total_noticias": analisis_mkt.total_noticias_capturadas(),
     }
 
     rutas_exportadas = historial.exportar_cierre_sesion(
@@ -1178,8 +1268,8 @@ def ejecutar_apagado_inmediato_ctrl_c(
     consola: ConsolaCuatroZonas,
     lector: GestorComandosInteractivos,
     config_sesion: Dict[str, Any],
-    infomarket: GestorInfoMarket,
-    indicadores: GestorIndicadores,
+    analisis_mkt: GestorAnalisisMercado,
+    scanner_mkt: ScannerMercado,
     cartera: CarteraVirtual,
     analizador_ai: AnalizadorAI,
     historial: GestorHistorial,
@@ -1195,15 +1285,15 @@ def ejecutar_apagado_inmediato_ctrl_c(
     lector.detener()
     try:
         analizador_ai.callback_alto_potencial = None
-        indicadores.callback_evento = None
-        infomarket.callback_noticia_relevante = None
+        scanner_mkt.callback_evento = None
+        analisis_mkt.callback_noticia_relevante = None
     except Exception:
         pass
     consola.restaurar_layout_normal(limpiar_pantalla=False)
 
     try:
-        infomarket.detener()
-        indicadores.detener()
+        analisis_mkt.detener()
+        scanner_mkt.detener()
         analizador_ai.detener()
         historial.actualizar_estado_sesion({"activa": False, "cerrando": True, "modo_cierre": "Interrupción Ctrl+C"})
     except Exception:
@@ -1216,16 +1306,17 @@ def ejecutar_apagado_inmediato_ctrl_c(
 
     try:
         cartera.cierre_inmediato_todas("Cierre inmediato por interrupción (Ctrl+C)")
-        _, rutas = _construir_y_exportar_reportes_finales(
+        res_c, rutas = _construir_y_exportar_reportes_finales(
             config_sesion=config_sesion,
             nombre_cierre="Cierre inmediato por Ctrl+C",
-            infomarket=infomarket,
+            analisis_mkt=analisis_mkt,
             cartera=cartera,
             analizador_ai=analizador_ai,
             historial=historial,
         )
         print(
             f"\n{Colores.AMARILLO}Sesión finalizada inmediatamente por Ctrl+C.{Colores.RESET}\n"
+            f"  • Tokens/Costo IA       : {res_c['ai_tokens_total']:,} tokens (${res_c['ai_costo_total_usd']:.5f} USD)\n"
             f"  • Resumen guardado en   : {Colores.VERDE}{rutas['resumen_md']}{Colores.RESET}\n"
             f"  • Posiciones guardadas  : {Colores.VERDE}{rutas['historial_csv']}{Colores.RESET}"
         )
@@ -1243,8 +1334,8 @@ def ejecutar_flujo_cierre_quit(
     consola: ConsolaCuatroZonas,
     lector: GestorComandosInteractivos,
     config_sesion: Dict[str, Any],
-    infomarket: GestorInfoMarket,
-    indicadores: GestorIndicadores,
+    analisis_mkt: GestorAnalisisMercado,
+    scanner_mkt: ScannerMercado,
     cartera: CarteraVirtual,
     analizador_ai: AnalizadorAI,
     historial: GestorHistorial,
@@ -1258,9 +1349,9 @@ def ejecutar_flujo_cierre_quit(
     lector.pausar()
     try:
         analizador_ai.callback_alto_potencial = None
-        indicadores.callback_evento = None
-        infomarket.callback_noticia_relevante = None
-        infomarket.detener()
+        scanner_mkt.callback_evento = None
+        analisis_mkt.callback_noticia_relevante = None
+        analisis_mkt.detener()
         analizador_ai.detener()
     except Exception:
         pass
@@ -1312,7 +1403,7 @@ def ejecutar_flujo_cierre_quit(
             print(f"{Colores.ROJO}Opción inválida. Ingrese 1, 2 o 3.{Colores.RESET}")
 
         historial.actualizar_estado_sesion({"cerrando": True, "modo_cierre": nombre_cierre})
-        infomarket.detener()
+        analisis_mkt.detener()
         analizador_ai.detener()
 
         if opcion == 3:
@@ -1324,7 +1415,7 @@ def ejecutar_flujo_cierre_quit(
                 f"\n{Colores.CIAN}Ejecutando {nombre_cierre}... "
                 f"(Presione [F] o [Ctrl+C] en cualquier momento para liquidar de inmediato){Colores.RESET}"
             )
-            mapa_m = indicadores.obtener_mapa_precios_y_pe()
+            mapa_m = scanner_mkt.obtener_mapa_precios_y_pe()
             en_perdida = [tk for tk, p in cartera.posiciones.items() if p.pyg_porcentual <= 0]
             pan_tk = analizador_ai.evaluar_panorama_cierre_perdidas(en_perdida)
             for lg in cartera.evaluar_paso_cierre_progresivo(opcion, mapa_m, pan_tk):
@@ -1346,19 +1437,19 @@ def ejecutar_flujo_cierre_quit(
                     print(
                         f"  {Colores.GRIS}[Monitoreando {len(cartera.posiciones)} posición(es) abierta(s) en {nombre_cierre}...]{Colores.RESET}"
                     )
-                    indicadores.actualizar_todos_los_tickers()
-                    mapa_m = indicadores.obtener_mapa_precios_y_pe()
+                    scanner_mkt.actualizar_todos_los_tickers()
+                    mapa_m = scanner_mkt.obtener_mapa_precios_y_pe()
                     en_perdida = [tk for tk, p in cartera.posiciones.items() if p.pyg_porcentual <= 0]
                     pan_tk = analizador_ai.evaluar_panorama_cierre_perdidas(en_perdida)
                     for lg in cartera.evaluar_paso_cierre_progresivo(opcion, mapa_m, pan_tk):
                         print(f"  {Colores.VERDE}• {lg}{Colores.RESET}")
 
-        indicadores.detener()
+        scanner_mkt.detener()
 
         resumen_final, rutas_exportadas = _construir_y_exportar_reportes_finales(
             config_sesion=config_sesion,
             nombre_cierre=nombre_cierre,
-            infomarket=infomarket,
+            analisis_mkt=analisis_mkt,
             cartera=cartera,
             analizador_ai=analizador_ai,
             historial=historial,
@@ -1384,7 +1475,13 @@ def ejecutar_flujo_cierre_quit(
             f"Alza: {resumen_final['ai_alcistas']} | Baja: {resumen_final['ai_bajistas']} | Neutrales: {resumen_final['ai_neutrales']} | "
             f"Ahorradas lote/filtro: {int(resumen_final['ai_consultas_ahorradas_lote']) + int(resumen_final['ai_consultas_filtradas'])}"
         )
-        print(f"  • Noticias Procesadas : {resumen_final['total_noticias']}")
+        print(
+            f"  • Tokens y Costo IA   : {resumen_final['ai_tokens_total']:,} tokens "
+            f"(In:{resumen_final['ai_tokens_input']:,} | Out:{resumen_final['ai_tokens_output']:,} | "
+            f"Think:{resumen_final['ai_tokens_thought']:,} | Cache:{resumen_final['ai_tokens_cached']:,}) | "
+            f"Costo: {Colores.VERDE}${resumen_final['ai_costo_total_usd']:.5f} USD{Colores.RESET}"
+        )
+        print(f"  • Eventos Informativos: {resumen_final['total_noticias']} (6 secciones: analisis.py)")
         print(f"  • Archivo Resumen     : {Colores.VERDE}{rutas_exportadas['resumen_md']}{Colores.RESET}")
         print(f"  • Archivo Posiciones  : {Colores.VERDE}{rutas_exportadas['historial_csv']}{Colores.RESET}")
         print(f"{Colores.CIAN}{'═' * 86}{Colores.RESET}")
@@ -1404,8 +1501,8 @@ def ejecutar_flujo_cierre_quit(
             consola=consola,
             lector=lector,
             config_sesion=config_sesion,
-            infomarket=infomarket,
-            indicadores=indicadores,
+            analisis_mkt=analisis_mkt,
+            scanner_mkt=scanner_mkt,
             cartera=cartera,
             analizador_ai=analizador_ai,
             historial=historial,
@@ -1483,16 +1580,17 @@ def main() -> None:
         historial=historial,
     )
 
-    infomarket = GestorInfoMarket(
+    analisis_mkt = GestorAnalisisMercado(
         tickers=list(cfg["tickers"]),
         historial=historial,
     )
 
-    indicadores = GestorIndicadores(
+    scanner_mkt = ScannerMercado(
         tickers=list(cfg["tickers"]),
         modo_operacion=str(cfg["modo_operacion"]),
         historial=historial,
     )
+    analisis_mkt.vincular_scanner(scanner_mkt)
 
     def _on_alto_potencial_ia(evento: EventoImpresionPrincipal) -> None:
         bloque = formatear_bloque_alto_potencial(evento)
@@ -1502,8 +1600,8 @@ def main() -> None:
         modelo_clave=str(cfg["modelo_clave"]),
         api_key=str(cfg["api_key"]),
         modo_operacion=str(cfg["modo_operacion"]),
-        infomarket=infomarket,
-        indicadores=indicadores,
+        infomarket=analisis_mkt,
+        indicadores=scanner_mkt,
         cartera=cartera,
         historial=historial,
         callback_alto_potencial=_on_alto_potencial_ia,
@@ -1516,8 +1614,8 @@ def main() -> None:
         )
         analizador_ai._stats.detalle_alerta = str(cfg.get("mensaje_conexion", ""))[:110]
 
-    infomarket.callback_noticia_relevante = analizador_ai.encolar_por_noticia
-    indicadores.callback_evento = analizador_ai.encolar_por_indicadores
+    analisis_mkt.callback_noticia_relevante = analizador_ai.encolar_por_noticia
+    scanner_mkt.callback_evento = analizador_ai.encolar_por_indicadores
 
     # Abrir las 3 terminales secundarias en sus cuadrantes sin robar foco
     print(f"{Colores.CIAN}Abriendo terminales secundarias (/v, /n, /d) en cuadrantes de pantalla...{Colores.RESET}")
@@ -1530,7 +1628,7 @@ def main() -> None:
     aviso_init = (
         f"Aviso terminales: {fallos_term[0]}"
         if fallos_term
-        else "Descargando noticias 48h y cotizaciones... Comandos activos: /v /n /d /help /quit."
+        else "Descargando 6 secciones informativas y scanner (17 ind.)... Comandos: /v /n /d /help /quit."
     )
     consola.establecer_aviso(
         aviso_init,
@@ -1538,28 +1636,32 @@ def main() -> None:
     )
     consola.renderizar_pie_tres_lineas(
         stats_ai=analizador_ai.obtener_estadisticas_supervisor(),
-        sup_noticias=infomarket.obtener_estado_supervision(),
+        sup_noticias=analisis_mkt.obtener_estado_supervision(),
         forzar=True,
     )
 
     def _on_ciclo_indicadores(mapa_precios: Dict[str, Dict[str, Any]]) -> None:
         cartera.actualizar_precios_mercado(mapa_precios)
         analizador_ai.registrar_ciclo_datos_mercado(mapa_precios)
+        try:
+            analisis_mkt.evaluar_reportes_con_scanner(scanner_mkt)
+        except Exception:
+            pass
 
     def _arranque_datos_background() -> None:
-        n_hist = infomarket.descargar_contexto_inicial(dias_previos=2)
+        n_hist = analisis_mkt.descargar_contexto_inicial(dias_previos=2)
         if evento_interrupcion.is_set() or consola._cerrando_tui:
             return
         consola.establecer_aviso(
-            f"Contexto listo ({n_hist} noticias 48h). Calculando indicadores de {len(cfg['tickers'])} acciones...",
+            f"6 secciones listas ({n_hist} eventos). Escaneando 17 indicadores y reportes de {len(cfg['tickers'])} acciones...",
             es_feedback_usuario=False,
         )
-        indicadores.actualizar_todos_los_tickers()
+        scanner_mkt.actualizar_todos_los_tickers()
         if evento_interrupcion.is_set() or consola._cerrando_tui:
             return
-        _on_ciclo_indicadores(indicadores.obtener_mapa_precios_y_pe())
-        infomarket.iniciar_monitoreo_continuo()
-        indicadores.iniciar_monitoreo_continuo(callback_ciclo_precios=_on_ciclo_indicadores)
+        _on_ciclo_indicadores(scanner_mkt.obtener_mapa_precios_y_pe())
+        analisis_mkt.iniciar_monitoreo_continuo()
+        scanner_mkt.iniciar_monitoreo_continuo(callback_ciclo_precios=_on_ciclo_indicadores)
         analizador_ai.iniciar_worker()
         consola.establecer_aviso(
             "Sistema activo | /v /n /d | /pausar /reanudar IA | /modelo /lote /apikey /quit (Tab=completar)",
@@ -1601,8 +1703,8 @@ def main() -> None:
                     consola=consola,
                     lector=lector,
                     config_sesion=cfg,
-                    infomarket=infomarket,
-                    indicadores=indicadores,
+                    analisis_mkt=analisis_mkt,
+                    scanner_mkt=scanner_mkt,
                     cartera=cartera,
                     analizador_ai=analizador_ai,
                     historial=historial,
@@ -1627,8 +1729,8 @@ def main() -> None:
                         consola=consola,
                         lector=lector,
                         config_sesion=cfg,
-                        infomarket=infomarket,
-                        indicadores=indicadores,
+                        analisis_mkt=analisis_mkt,
+                        scanner_mkt=scanner_mkt,
                         cartera=cartera,
                         analizador_ai=analizador_ai,
                         historial=historial,
@@ -1647,12 +1749,15 @@ def main() -> None:
                     consola.establecer_aviso(msg_r)
                 elif cmd_norm == "/help":
                     consola.establecer_aviso(
-                        "Comandos: /v Cartera /n Noticias /d Datos | /pausar /reanudar IA | /modelo | /lote | /apikey | /quit | Tab=Completar"
+                        "Comandos: /v Cartera /n Análisis /d Scanner | /pausar /reanudar IA | /modelo | /lote | /apikey | /quit | Tab=Completar"
                     )
                 elif cmd_norm == "/lote":
                     st = analizador_ai.obtener_estadisticas_supervisor()
                     cola_s = ", ".join(st.get("tickers_cola", [])) or "vacía"
                     ult_s = ", ".join(st.get("ultimos_tickers_consulta", [])) or "ninguno aún"
+                    tok_ult_l = int(st.get("tokens_ultima_total", 0) or 0)
+                    tok_ac_l = int(st.get("tokens_acum_total", 0) or 0)
+                    cost_ac_l = float(st.get("costo_acumulado_usd", 0.0) or 0.0)
                     if st.get("consultas_pausadas"):
                         est_off = (
                             f" | OFFLINE(Not:{st.get('noticias_durante_pausa', 0)},"
@@ -1666,7 +1771,9 @@ def main() -> None:
                     else:
                         est_off = ""
                     consola.establecer_aviso(
-                        f"Lotes [{st.get('regimen_horario')}] | Último: [{ult_s}] | Cola: [{cola_s}] | Ahorradas: {st.get('ahorradas_lote')}/{st.get('filtradas_gatekeeper')}{est_off}"
+                        f"Lotes [{st.get('regimen_horario')}] | Último: [{ult_s}] | Cola: [{cola_s}] | "
+                        f"Tok:{tok_ult_l:,}/{tok_ac_l:,} (${cost_ac_l:.4f}) | "
+                        f"Ahorradas: {st.get('ahorradas_lote')}/{st.get('filtradas_gatekeeper')}{est_off}"
                     )
                 elif cmd_norm == "/apikey" or cmd_norm.startswith("/apikey "):
                     nueva_k = cmd_raw[7:].strip()
@@ -1710,7 +1817,7 @@ def main() -> None:
             if hubo_comando or (ahora - ultimo_refresco_ui >= 0.75):
                 consola.renderizar_pie_tres_lineas(
                     stats_ai=analizador_ai.obtener_estadisticas_supervisor(),
-                    sup_noticias=infomarket.obtener_estado_supervision(),
+                    sup_noticias=analisis_mkt.obtener_estado_supervision(),
                     forzar=hubo_comando,
                 )
                 ultimo_refresco_ui = ahora

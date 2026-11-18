@@ -7,10 +7,11 @@ y visor dedicado para las tres terminales secundarias dependientes:
 
 1. `/v` (`/car-v`) (Cuadrante Superior Derecho) : Cartera virtual y estadísticas porcentuales en tiempo real
                                              actualizadas en la misma área visual sin parpadeo.
-2. `/n` (`/mkinfo`) (Cuadrante Inferior Izquierdo): Noticias previas (2 días) y en tiempo real secuenciales con formato:
-                                             Fecha y hora (AM/PM con segs) | [ticker azul] | plataforma | link
-3. `/d` (`/datos`) (Cuadrante Inferior Derecho)  : Datos financieros e indicadores SOLO de empresas con alto potencial,
-                                             con colores exactos de evaluación y resaltado de alarmas.
+2. `/n` (`/mkinfo`) (Cuadrante Inferior Izquierdo): Flujo secuencial de eventos de las 6 secciones de `analisis.py`
+                                             (Noticias, Filings 8-K, Reportes Resultados, Congreso, Fed y Macro):
+                                             Fecha y hora (AM/PM con segs) | [ticker azul] | Sección | plataforma | link
+3. `/d` (`/datos`) (Cuadrante Inferior Derecho)  : Datos financieros, reporte de resultados, patrones swing y los
+                                             17 indicadores de `scanner.py` SOLO de empresas con alto potencial.
 
 Diseño anti-bloqueo / anti-robo de foco:
 - Las terminales secundarias nacen en su cuadrante usando `STARTUPINFO` (`SW_SHOWNOACTIVATE`) y
@@ -34,7 +35,10 @@ import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
+sys.dont_write_bytecode = True
+
 from config import (
+    ETIQUETAS_SECCIONES_ANALISIS,
     Colores,
     activar_ansi_windows,
     colorear_evaluacion,
@@ -81,9 +85,9 @@ def calcular_rectangulo_cuadrante(indice_cuadrante: int) -> Tuple[int, int, int,
     """
     Divide la pantalla en 4 partes iguales:
     - Cuadrante 1 (0): Superior Izquierdo -> Terminal Principal (`main.py`)
-    - Cuadrante 2 (1): Superior Derecho   -> Cartera Virtual (`/car-v`)
-    - Cuadrante 3 (2): Inferior Izquierdo -> Noticias InfoMarket (`/mkinfo`)
-    - Cuadrante 4 (3): Inferior Derecho   -> Datos e Indicadores (`/datos`)
+    - Cuadrante 2 (1): Superior Derecho   -> Cartera Virtual (`/v` / `/car-v`)
+    - Cuadrante 3 (2): Inferior Izquierdo -> Análisis 6 Secciones (`/n` / `/mkinfo`)
+    - Cuadrante 4 (3): Inferior Derecho   -> Scanner Datos, Reportes e Indicadores (`/d` / `/datos`)
     """
     ox, oy, ancho_total, alto_total = obtener_area_trabajo_pantalla()
     mitad_w = ancho_total // 2
@@ -203,12 +207,12 @@ ROLES_TERMINALES = {
     "mkinfo": {
         "cuadrante": 2,
         "comando": "/n",
-        "titulo": "VAGY-M1 | INFOMARKET NOTICIAS SECUENCIALES (/n)",
+        "titulo": "VAGY-M1 | ANÁLISIS 6 SECCIONES EN TIEMPO REAL (/n)",
     },
     "datos": {
         "cuadrante": 3,
         "comando": "/d",
-        "titulo": "VAGY-M1 | DATOS FINANCIEROS E INDICADORES ALTO POTENCIAL (/d)",
+        "titulo": "VAGY-M1 | SCANNER DATOS, REPORTES Y 17 INDICADORES (/d)",
     },
 }
 
@@ -277,6 +281,7 @@ class GestorTerminalesSecundarias:
 
         args_script = [
             sys.executable,
+            "-B",
             "-u",
             str(self._script_actual),
             "--role",
@@ -289,6 +294,8 @@ class GestorTerminalesSecundarias:
 
         try:
             workdir = str(self._script_actual.parent)
+            env_hijo = os.environ.copy()
+            env_hijo["PYTHONDONTWRITEBYTECODE"] = "1"
             if os.name == "nt":
                 x, y, w, h = calcular_rectangulo_cuadrante(ROLES_TERMINALES[rol_canon]["cuadrante"])
                 si = subprocess.STARTUPINFO()
@@ -302,7 +309,6 @@ class GestorTerminalesSecundarias:
                 flags_aislados = subprocess.CREATE_NEW_CONSOLE | subprocess.CREATE_NEW_PROCESS_GROUP
                 ruta_conhost = shutil.which("conhost.exe") or r"C:\Windows\System32\conhost.exe"
                 cmd = ([ruta_conhost] + args_script) if os.path.exists(ruta_conhost) else args_script
-                env_hijo = os.environ.copy()
                 env_hijo.pop("WT_SESSION", None)
                 env_hijo.pop("WT_PROFILE_ID", None)
                 proc = subprocess.Popen(
@@ -314,7 +320,7 @@ class GestorTerminalesSecundarias:
                     close_fds=True,
                 )
             else:
-                proc = subprocess.Popen(args_script, cwd=workdir, close_fds=True)
+                proc = subprocess.Popen(args_script, cwd=workdir, env=env_hijo, close_fds=True)
 
             time.sleep(0.06)
             rc = proc.poll()
@@ -496,13 +502,51 @@ def ejecutar_vista_cartera(parent_pid: int, sesion_dir: Path) -> None:
         sys.stdout.flush()
 
 
+def _fmt_monto_compacto(valor: object) -> str:
+    """Formatea montos de ingresos en $B / $M sin dependencias externas pesadas."""
+    try:
+        if valor is None:
+            return "N/D"
+        v = float(valor)
+    except Exception:
+        return "N/D"
+    abs_v = abs(v)
+    if abs_v >= 1e9:
+        return f"${v / 1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"${v / 1e6:.1f}M"
+    return f"${v:,.0f}"
+
+
+def _etiqueta_seccion_color(seccion: str, subcategoria: str = "") -> str:
+    sec_u = (seccion or "NOTICIAS").strip().upper()
+    etq = ETIQUETAS_SECCIONES_ANALISIS.get(sec_u, sec_u)
+    sub = (subcategoria or "").strip()
+    if sec_u == "DIVULGACIONES_CONGRESO" and sub:
+        etq = f"Congreso/{sub}"
+    elif sec_u in ("FILINGS_8K", "REPORTES_RESULTADOS", "MACROECONOMIA") and sub:
+        etq = f"{etq}/{sub[:26]}"
+
+    mapa_col = {
+        "NOTICIAS": Colores.GRIS,
+        "FILINGS_8K": Colores.AMARILLO,
+        "REPORTES_RESULTADOS": Colores.CIAN,
+        "DIVULGACIONES_CONGRESO": Colores.MORADO,
+        "FED": Colores.VERDE,
+        "MACROECONOMIA": Colores.NARANJA,
+    }
+    col = mapa_col.get(sec_u, Colores.GRIS)
+    return f"{col}{etq}{Colores.RESET}"
+
+
 def ejecutar_vista_mkinfo(parent_pid: int, sesion_dir: Path) -> None:
-    """Vista `/n` (`/mkinfo`): Flujo secuencial de noticias previas (2 días) y en tiempo real."""
+    """Vista `/n` (`/mkinfo`): Flujo secuencial de eventos de las 6 secciones de `analisis.py`."""
     archivo_estado = sesion_dir / "session_state.json"
     archivo_noticias = sesion_dir / "mkinfo_noticias.jsonl"
 
-    print(f"{Colores.CIAN}{Colores.BOLD}═══ INFOMARKET — FLUJO SECUENCIAL DE NOTICIAS (/n) ═══{Colores.RESET}")
-    print(f"{Colores.GRIS}Formato: Fecha y hora (AM/PM) | [ticker] | plataforma | link{Colores.RESET}\n")
+    print(f"{Colores.CIAN}{Colores.BOLD}═══ ANÁLISIS MULTI-SECCIÓN — FLUJO SECUENCIAL (/n) ═══{Colores.RESET}")
+    print(f"{Colores.GRIS}Secciones: Noticias | Filings 8-K | Resultados (Scanner) | Congreso | Fed | Macroeconomía{Colores.RESET}")
+    print(f"{Colores.GRIS}Formato: Fecha y hora (AM/PM) | [ticker] | Sección | plataforma | link{Colores.RESET}\n")
 
     offset = 0
     while _padre_y_sesion_siguen_activos(parent_pid, archivo_estado):
@@ -521,9 +565,12 @@ def ejecutar_vista_mkinfo(parent_pid: int, sesion_dir: Path) -> None:
                         n = json.loads(linea)
                         fh = n.get("fecha_hora_ampm", "")
                         tk = n.get("ticker", "MKT")
+                        sec = str(n.get("seccion", "NOTICIAS"))
+                        subcat = str(n.get("subcategoria", ""))
                         plat = n.get("plataforma", "Fuente")
                         link = n.get("link", "")
-                        print(f"{fh} | {ticker_azul(tk)} | {plat} | {link}", flush=True)
+                        etq_sec = _etiqueta_seccion_color(sec, subcat)
+                        print(f"{fh} | {ticker_azul(tk)} | {etq_sec} | {plat} | {link}", flush=True)
                     except Exception:
                         continue
             except Exception:
@@ -532,11 +579,11 @@ def ejecutar_vista_mkinfo(parent_pid: int, sesion_dir: Path) -> None:
 
 
 def ejecutar_vista_datos(parent_pid: int, sesion_dir: Path) -> None:
-    """Vista `/d` (`/datos`): Datos financieros e indicadores de empresas con alto potencial."""
+    """Vista `/d` (`/datos`): Datos financieros, reporte resultados, patrones y 17 indicadores de `scanner.py`."""
     archivo_estado = sesion_dir / "session_state.json"
     archivo_datos = sesion_dir / "datos_eventos.jsonl"
 
-    print(f"{Colores.CIAN}{Colores.BOLD}═══ DATOS FINANCIEROS E INDICADORES DE ALTO POTENCIAL (/d) ═══{Colores.RESET}")
+    print(f"{Colores.CIAN}{Colores.BOLD}═══ SCANNER CUANTITATIVO — DATOS, REPORTES Y 17 INDICADORES (/d) ═══{Colores.RESET}")
     print(f"{Colores.GRIS}Solo se listan empresas que superan el filtro cuantitativo de alto potencial y certeza.{Colores.RESET}\n")
 
     offset = 0
@@ -560,12 +607,13 @@ def ejecutar_vista_datos(parent_pid: int, sesion_dir: Path) -> None:
                         eval_gen = ev.get("evaluacion_general", "NEUTRAL")
                         certeza = float(ev.get("certeza_pct", 0.0))
                         potencial = float(ev.get("potencial_score", 0.0))
+                        patrones = list(ev.get("patrones_detectados") or [])
 
                         pe_s = f"{df['pe_ratio']:.2f}" if df.get("pe_ratio") is not None else "N/D"
                         fpe_s = f"{df['pe_forward']:.2f}" if df.get("pe_forward") is not None else "N/D"
                         mcap_s = f"${df['cap_mercado_b']:.2f}B" if df.get("cap_mercado_b") is not None else "N/D"
 
-                        print(f"{Colores.CIAN}{'─' * 88}{Colores.RESET}")
+                        print(f"{Colores.CIAN}{'─' * 92}{Colores.RESET}")
                         print(
                             f"{fh} | {ticker_azul(tk)} | Potencial: {Colores.BOLD}{potencial:.1f}/100{Colores.RESET} "
                             f"(Certeza: {certeza:.1f}%) | Evaluación General: {colorear_evaluacion(eval_gen)}"
@@ -573,11 +621,38 @@ def ejecutar_vista_datos(parent_pid: int, sesion_dir: Path) -> None:
                         print(
                             f"  {Colores.BOLD}Datos Financieros:{Colores.RESET} "
                             f"Precio=${df.get('precio_actual', 0.0):.2f} ({df.get('cambio_diario_pct', 0.0):+.2f}%) | "
-                            f"P/E={pe_s} (Fwd={fpe_s}) | Cap={mcap_s} | "
-                            f"Soporte=${df.get('soporte_1', 0.0):.2f}/${df.get('soporte_2', 0.0):.2f} | "
-                            f"Resistencia=${df.get('resistencia_1', 0.0):.2f}/${df.get('resistencia_2', 0.0):.2f}"
+                            f"P/E={pe_s} (Fwd={fpe_s}) | Cap={mcap_s} | VWAP=${df.get('vwap_sesion', 0.0):.2f} | "
+                            f"S1/S2=${df.get('soporte_1', 0.0):.2f}/${df.get('soporte_2', 0.0):.2f} | "
+                            f"R1/R2=${df.get('resistencia_1', 0.0):.2f}/${df.get('resistencia_2', 0.0):.2f}"
                         )
-                        print(f"  {Colores.BOLD}Indicadores Cuantitativos:{Colores.RESET}")
+                        rep = df.get("reporte_resultados")
+                        if isinstance(rep, dict):
+                            d_h = rep.get("dias_hasta_reporte")
+                            d_txt = f" ({d_h}d)" if d_h is not None else ""
+                            ing_esp = _fmt_monto_compacto(rep.get("ingresos_esperados"))
+                            ing_rep = _fmt_monto_compacto(rep.get("ingresos_reportados"))
+                            yoy = rep.get("ingresos_crecimiento_yoy_pct")
+                            yoy_txt = f" ({float(yoy):+.1f}% YoY)" if yoy is not None else ""
+                            eps_rep = rep.get("eps_reportado")
+                            eps_esp = rep.get("eps_esperado")
+                            srp = rep.get("eps_sorpresa_pct")
+                            eps_txt = (
+                                f"{float(eps_rep):.2f}/{float(eps_esp):.2f} ({float(srp):+.1f}%)"
+                                if (eps_rep is not None and eps_esp is not None and srp is not None)
+                                else (f"{float(eps_rep):.2f}" if eps_rep is not None else "N/D")
+                            )
+                            print(
+                                f"  {Colores.BOLD}Reporte Resultados:{Colores.RESET} "
+                                f"Próx={rep.get('fecha_proximo_reporte') or 'N/D'}{d_txt} | "
+                                f"Ing Esp={ing_esp} | Ing Rep={ing_rep}{yoy_txt} | "
+                                f"EPS={eps_txt} | Est={Colores.CIAN}{rep.get('evaluacion_reporte', 'PENDIENTE')}{Colores.RESET}"
+                            )
+                        if patrones:
+                            print(
+                                f"  {Colores.BOLD}Patrones Swing:{Colores.RESET} "
+                                f"{Colores.MORADO}{', '.join(patrones)}{Colores.RESET}"
+                            )
+                        print(f"  {Colores.BOLD}Indicadores Cuantitativos ({len(ev.get('indicadores', []))}):{Colores.RESET}")
                         for ind in ev.get("indicadores", []):
                             cat = ind.get("categoria", "")
                             nom = ind.get("nombre", "")

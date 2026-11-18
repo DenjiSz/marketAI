@@ -1,31 +1,35 @@
 # -*- coding: utf-8 -*-
 """
-indicadores.py
-==============
-Motor cuantitativo de descarga de datos financieros actuales y cálculo vectorizado de
-indicadores técnicos, de tendencia, flujo institucional y estructura de volumen real.
+scanner.py
+==========
+Escáner cuantitativo multi-empresa (evolución de `indicadores.py`).
+Descarga datos financieros/fundamentales, flujo de volumen real, reporte de resultados
+y calcula vectorizadamente 17 indicadores técnicos, institucionales y de acción del precio:
 
-Incluye:
 - Datos financieros de la empresa: Precio actual, cambio %, P/E (Trailing y Forward),
-  Soporte 1/2, Resistencia 1/2, Capitalización de Mercado, Rango 52 semanas, ATR y Volumen.
-- Los 10 indicadores base especificados con sus cortes exactos:
-  1. Oscilador (contrarian) | RSI(14) | cortes 20/35/65/80
-  2. Oscilador (contrarian) | Stoch(14,3,3) | cortes 10/20/80/90
-  3. Oscilador (contrarian) | Bollinger %B(20,2) | cortes 0/0.2/0.8/1
-  4. Oscilador (contrarian) | MFI(14), con volumen | cortes 15/30/70/85
-  5. Tendencia | EMA 9/21 | spread dividido por ATR
-  6. Tendencia | MACD histograma | dividido por ATR
-  7. Tendencia | VWAP de sesión | z-score de la distancia %
-  8. Tendencia | ADX/DI | DI+ − DI−, vale 0 si ADX < 20
-  9. Supertrend(10,2.5)/ATR
+  Soporte 1/2, Resistencia 1/2, Capitalización de Mercado, Rango 52 semanas, ATR, Volumen
+  y **Reporte de Resultados** (fecha próximo reporte, ingresos esperados vs reportados, EPS y sorpresa).
+- 17 Indicadores cuantitativos y patrones swing/estructurales:
+  1.  Oscilador (contrarian) | RSI(14) | cortes 20/35/65/80
+  2.  Oscilador (contrarian) | Stoch(14,3,3) | cortes 10/20/80/90
+  3.  Oscilador (contrarian) | Bollinger %B(20,2) | cortes 0/0.2/0.8/1
+  4.  Oscilador (contrarian) | MFI(14), con volumen | cortes 15/30/70/85
+  5.  Tendencia | EMA 9/21 | spread dividido por ATR
+  6.  Tendencia | MACD histograma | dividido por ATR
+  7.  Tendencia | VWAP de sesión | z-score de la distancia %
+  8.  Tendencia | ADX/DI | DI+ - DI-, vale 0 si ADX < 20
+  9.  Supertrend(10,2.5)/ATR
   10. CMF(20) Flujo Inst.
-- Indicadores adicionales estructurales y de volumen real para mayor precisión:
   11. Volumen Real | RVOL(20) Impulso Direccional
   12. Volumen Real | OBV Z-Score(20) Acumulación
   13. Estructural | Rango S/R & Ruptura (BOS)
+  14. Acción de Precio | Ruptura Rango Apertura (ORB)
+  15. Patrón Chartista | Bandera (Bull/Bear Flag)
+  16. Reversión Swing | Rebote por Sobreventa / Rechazo Sobrecompra
+  17. Marco Diario | Tendencia SMA 20/50 & Compresión Squeeze
 
-Filtra eventos con nivel de certeza/potencial y solo emite a la terminal secundaria `/datos`
-aquellos activos que alcanzan alto potencial operativo según el modo (`spot` o `short y long`).
+Filtra eventos con nivel de certeza/potencial y solo emite a la terminal secundaria `/d`
+y al acumulador multi-pilar de IA aquellos activos que alcanzan alto potencial operativo.
 """
 
 from __future__ import annotations
@@ -37,7 +41,9 @@ import time
 import warnings
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
-from typing import Callable, Dict, List, Optional, Tuple
+from datetime import datetime, time as dt_time
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -59,14 +65,14 @@ warnings.filterwarnings("ignore", category=FutureWarning)
 
 
 # ==============================================================================
-# 1. ESTRUCTURAS DE DATOS DE INDICADORES Y SNAPSHOT FINANCIERO
+# 1. ESTRUCTURAS DE DATOS DE INDICADORES, RESULTADOS Y SNAPSHOT FINANCIERO
 # ==============================================================================
 
 @dataclass
 class ResultadoIndicador:
     """Resultado individual de un indicador técnico/estructural con su evaluación y alarma."""
 
-    categoria: str          # Ej. "Oscilador (contrarian)", "Tendencia", "Flujo Inst.", "Volumen Real", "Estructural"
+    categoria: str          # Ej. "Oscilador (contrarian)", "Tendencia", "Flujo Inst.", "Patrón Chartista", etc.
     nombre: str             # Ej. "RSI(14)"
     valor: float            # Valor numérico principal calculado
     texto_valor: str        # Representación legible con unidades o cortes
@@ -74,13 +80,36 @@ class ResultadoIndicador:
     puntaje: float          # Escala normalizada [-2.0, +2.0] para confluencia
     alarma: Optional[str]   # "COMPRA" | "VENTA" | None (resalta nombre en verde o rojo)
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class DatosReporteResultados:
+    """Datos de earnings/resultados trimestrales extraídos para análisis conjunto con `analisis.py`."""
+
+    ticker: str
+    fecha_proximo_reporte: Optional[str] = None      # YYYY-MM-DD
+    dias_hasta_reporte: Optional[int] = None         # Días calendario hasta próximo reporte
+    fecha_ultimo_reporte: Optional[str] = None       # YYYY-MM-DD
+    ingresos_esperados: Optional[float] = None       # USD estimados trimestre actual/próximo
+    ingresos_reportados: Optional[float] = None      # USD reales último trimestre reportado
+    ingresos_crecimiento_yoy_pct: Optional[float] = None
+    ingresos_sorpresa_pct: Optional[float] = None
+    eps_esperado: Optional[float] = None
+    eps_reportado: Optional[float] = None
+    eps_sorpresa_pct: Optional[float] = None
+    evaluacion_reporte: str = "PENDIENTE"            # "POSITIVO" | "MIXTO" | "NEGATIVO" | "PROXIMO_INMINENTE" | "PENDIENTE"
+    resumen_reporte: str = ""
+    actualizado_epoch: float = 0.0
+
+    def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
 
 
 @dataclass
 class DatosFinancieros:
-    """Datos fundamentales y niveles estructurales clave de una acción."""
+    """Datos fundamentales, niveles estructurales clave y reporte de resultados de una acción."""
 
     ticker: str
     precio_actual: float
@@ -99,14 +128,18 @@ class DatosFinancieros:
     max_52_semanas: Optional[float]
     min_52_semanas: Optional[float]
     beta: Optional[float]
+    reporte_resultados: Optional[DatosReporteResultados] = None
 
-    def to_dict(self) -> Dict:
-        return asdict(self)
+    def to_dict(self) -> Dict[str, Any]:
+        datos = asdict(self)
+        if self.reporte_resultados is not None:
+            datos["reporte_resultados"] = self.reporte_resultados.to_dict()
+        return datos
 
 
 @dataclass
 class AnalisisTecnicoTicker:
-    """Paquete completo financiero + 13 indicadores + evaluación de certeza/potencial."""
+    """Paquete completo financiero + 17 indicadores + patrones + evaluación de certeza/potencial."""
 
     ticker: str
     epoch: float
@@ -119,10 +152,11 @@ class AnalisisTecnicoTicker:
     certeza_pct: float               # 0.0 - 100.0
     alarmas_compra: List[str] = field(default_factory=list)
     alarmas_venta: List[str] = field(default_factory=list)
+    patrones_detectados: List[str] = field(default_factory=list)
     es_evento_alto_potencial: bool = False
     motivo_evento: str = ""
 
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> Dict[str, Any]:
         return {
             "ticker": self.ticker,
             "epoch": self.epoch,
@@ -135,13 +169,14 @@ class AnalisisTecnicoTicker:
             "certeza_pct": self.certeza_pct,
             "alarmas_compra": self.alarmas_compra,
             "alarmas_venta": self.alarmas_venta,
+            "patrones_detectados": self.patrones_detectados,
             "es_evento_alto_potencial": self.es_evento_alto_potencial,
             "motivo_evento": self.motivo_evento,
         }
 
 
 # ==============================================================================
-# 2. FUNCIONES MATEMÁTICAS VECTORIZADAS (NUMPY / PANDAS)
+# 2. FUNCIONES MATEMÁTICAS Y DETECCIÓN DE PATRONES (NUMPY / PANDAS)
 # ==============================================================================
 
 def _safe_float(val: object, default: float = 0.0) -> float:
@@ -150,6 +185,28 @@ def _safe_float(val: object, default: float = 0.0) -> float:
         return default if (math.isnan(f) or math.isinf(f)) else f
     except Exception:
         return default
+
+
+def _safe_opt_float(val: object) -> Optional[float]:
+    try:
+        if val is None:
+            return None
+        f = float(val)
+        return None if (math.isnan(f) or math.isinf(f)) else f
+    except Exception:
+        return None
+
+
+def formatear_monto_compacto(valor: Optional[float]) -> str:
+    """Formatea ingresos en $B / $M de forma legible."""
+    if valor is None:
+        return "N/D"
+    abs_v = abs(valor)
+    if abs_v >= 1e9:
+        return f"${valor / 1e9:.2f}B"
+    if abs_v >= 1e6:
+        return f"${valor / 1e6:.1f}M"
+    return f"${valor:,.0f}"
 
 
 def calcular_atr(high: pd.Series, low: pd.Series, close: pd.Series, periodo: int = 14) -> pd.Series:
@@ -179,7 +236,25 @@ def calcular_rsi(close: pd.Series, periodo: int = 14) -> float:
     return _safe_float(rsi.iloc[-1], 50.0)
 
 
-def calcular_stoch(high: pd.Series, low: pd.Series, close: pd.Series, k_len: int = 14, k_smooth: int = 3, d_smooth: int = 3) -> Tuple[float, float]:
+def calcular_rsi_serie(close: pd.Series, periodo: int = 14) -> pd.Series:
+    """Serie histórica de RSI(14) para detección de rebotes y divergencias."""
+    delta = close.diff()
+    ganancia = delta.clip(lower=0.0)
+    perdida = (-delta).clip(lower=0.0)
+    avg_gain = ganancia.ewm(alpha=1.0 / periodo, min_periods=periodo, adjust=False).mean()
+    avg_loss = perdida.ewm(alpha=1.0 / periodo, min_periods=periodo, adjust=False).mean()
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return (100.0 - (100.0 / (1.0 + rs))).fillna(50.0)
+
+
+def calcular_stoch(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    k_len: int = 14,
+    k_smooth: int = 3,
+    d_smooth: int = 3,
+) -> Tuple[float, float]:
     """Stochastic Oscillator (14, 3, 3) -> devuelve (%K suavizado, %D)."""
     lowest_low = low.rolling(window=k_len, min_periods=max(5, k_len // 2)).min()
     highest_high = high.rolling(window=k_len, min_periods=max(5, k_len // 2)).max()
@@ -192,13 +267,17 @@ def calcular_stoch(high: pd.Series, low: pd.Series, close: pd.Series, k_len: int
 
 def calcular_bollinger_pct_b(close: pd.Series, periodo: int = 20, mult: float = 2.0) -> float:
     """Bollinger %B(20, 2) = (Close - BandaInferior) / (BandaSuperior - BandaInferior)."""
+    pct_b = calcular_bollinger_pct_b_serie(close, periodo=periodo, mult=mult)
+    return _safe_float(pct_b.iloc[-1], 0.5)
+
+
+def calcular_bollinger_pct_b_serie(close: pd.Series, periodo: int = 20, mult: float = 2.0) -> pd.Series:
     sma = close.rolling(window=periodo, min_periods=max(5, periodo // 2)).mean()
     std = close.rolling(window=periodo, min_periods=max(5, periodo // 2)).std(ddof=0)
     upper = sma + mult * std
     lower = sma - mult * std
     ancho = (upper - lower).replace(0.0, np.nan)
-    pct_b = ((close - lower) / ancho).fillna(0.5)
-    return _safe_float(pct_b.iloc[-1], 0.5)
+    return ((close - lower) / ancho).fillna(0.5)
 
 
 def calcular_mfi(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.Series, periodo: int = 14) -> float:
@@ -308,7 +387,6 @@ def calcular_vwap_sesion_zscore(df: pd.DataFrame) -> Tuple[float, float]:
     tp = (df["High"] + df["Low"] + df["Close"]) / 3.0
     vol = df["Volume"].clip(lower=0.0)
 
-    # Aislar las barras de la última fecha de sesión disponible si el índice es temporal
     if isinstance(df.index, pd.DatetimeIndex) and len(df.index) > 0:
         fechas = df.index.date
         mask_hoy = fechas == fechas[-1]
@@ -330,7 +408,7 @@ def calcular_vwap_sesion_zscore(df: pd.DataFrame) -> Tuple[float, float]:
     if len(dist_pct) >= 4:
         media = _safe_float(dist_pct.mean(), 0.0)
         desv = _safe_float(dist_pct.std(ddof=0), 0.0)
-        zscore = ( _safe_float(dist_pct.iloc[-1]) - media ) / desv if desv > 1e-5 else _safe_float(dist_pct.iloc[-1])
+        zscore = (_safe_float(dist_pct.iloc[-1]) - media) / desv if desv > 1e-5 else _safe_float(dist_pct.iloc[-1])
     else:
         zscore = _safe_float(dist_pct.iloc[-1], 0.0)
 
@@ -347,14 +425,241 @@ def calcular_cmf(high: pd.Series, low: pd.Series, close: pd.Series, volume: pd.S
     return _safe_float(cmf.iloc[-1], 0.0)
 
 
+def calcular_ruptura_orb(
+    df_intra: pd.DataFrame,
+    precio_actual: float,
+    atr_14: float,
+    rvol: float,
+) -> Tuple[float, str, str, float, Optional[str]]:
+    """
+    Detecta Ruptura de Rango de Apertura (Opening Range Breakout - ORB):
+    Usa los primeros 30 minutos de la sesión regular (09:30-10:00 ET en velas 15m -> 2 barras)
+    o las 2 primeras velas de la fecha más reciente.
+    Devuelve: `(valor_atr_spread, evaluacion, texto, puntaje, alarma)`.
+    """
+    if df_intra is None or len(df_intra) < 4:
+        return 0.0, "NEUTRAL", "ORB N/D (pocas velas)", 0.0, None
+
+    try:
+        sub = df_intra.copy()
+        if isinstance(sub.index, pd.DatetimeIndex):
+            idx = sub.index
+            if idx.tz is None:
+                idx = idx.tz_localize("UTC")
+            idx_ny = idx.tz_convert(ZoneInfo("America/New_York"))
+            ultima_fecha = idx_ny[-1].date()
+            mask_dia = idx_ny.date == ultima_fecha
+            sub_dia = sub[mask_dia]
+            idx_dia = idx_ny[mask_dia]
+
+            # Barras regulares desde 09:30 ET
+            horas = idx_dia.time
+            mask_reg = (horas >= dt_time(9, 30)) & (horas < dt_time(16, 0))
+            sub_reg = sub_dia[mask_reg]
+            idx_reg = idx_dia[mask_reg]
+
+            if len(sub_reg) >= 2:
+                # Primeros 30 min (09:30 a 09:59 ET)
+                mask_orb = idx_reg.time < dt_time(10, 0)
+                sub_orb = sub_reg[mask_orb] if int(mask_orb.sum()) >= 1 else sub_reg.iloc[:2]
+                fuente = sub_reg
+            else:
+                sub_orb = sub_dia.iloc[:2]
+                fuente = sub_dia
+        else:
+            sub_orb = sub.iloc[-6:-4]
+            fuente = sub
+    except Exception:
+        sub_orb = df_intra.iloc[-min(len(df_intra), 8):-min(len(df_intra), 6)]
+        fuente = df_intra
+
+    if len(sub_orb) < 1 or len(fuente) < 2:
+        return 0.0, "NEUTRAL", "ORB en formación", 0.0, None
+
+    orb_high = _safe_float(sub_orb["High"].max(), precio_actual)
+    orb_low = _safe_float(sub_orb["Low"].min(), precio_actual)
+    spread_hi = (precio_actual - orb_high) / max(atr_14, 1e-4)
+    spread_lo = (orb_low - precio_actual) / max(atr_14, 1e-4)
+
+    # Si aún estamos dentro del rango inicial (primeras 2 barras de apertura)
+    if len(fuente) <= 2:
+        return 0.0, "NEUTRAL", f"ORB formando [${orb_low:.2f}-${orb_high:.2f}]", 0.0, None
+
+    if spread_hi >= 0.25 and rvol >= 1.25:
+        return round(spread_hi, 3), "COMPRA FUERTE", f"ORB Alcista +{spread_hi:.2f} ATR > ${orb_high:.2f} (RVOL {rvol:.2f}x)", 2.0, "COMPRA"
+    if spread_hi > 0.05:
+        return round(spread_hi, 3), "COMPRA", f"Sobre ORB High ${orb_high:.2f} (+{spread_hi:.2f} ATR)", 1.0, None
+    if spread_lo >= 0.25 and rvol >= 1.25:
+        return round(-spread_lo, 3), "VENTA FUERTE", f"ORB Bajista -{spread_lo:.2f} ATR < ${orb_low:.2f} (RVOL {rvol:.2f}x)", -2.0, "VENTA"
+    if spread_lo > 0.05:
+        return round(-spread_lo, 3), "VENTA", f"Bajo ORB Low ${orb_low:.2f} (-{spread_lo:.2f} ATR)", -1.0, None
+    return 0.0, "NEUTRAL", f"Dentro ORB [${orb_low:.2f}-${orb_high:.2f}]", 0.0, None
+
+
+def detectar_patron_bandera(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    volume: pd.Series,
+    atr_14: float,
+    rvol: float,
+) -> Tuple[float, str, str, float, Optional[str]]:
+    """
+    Detecta Patrón Bandera (Bull Flag / Bear Flag):
+    1. Mástil previo fuerte en barras [-18:-4] con desplazamiento >= 2.0 * ATR.
+    2. Consolidación estrecha en últimas 3-5 barras (retroceso <= 45% del mástil).
+    3. Ruptura o proximidad al borde de continuación con flujo acorde.
+    """
+    if len(close) < 20:
+        return 0.0, "NEUTRAL", "Bandera N/D", 0.0, None
+
+    c_arr = close.to_numpy(dtype=float)
+    h_arr = high.to_numpy(dtype=float)
+    l_arr = low.to_numpy(dtype=float)
+    v_arr = volume.to_numpy(dtype=float)
+    denom = max(atr_14, 1e-4)
+
+    # Analizar ventana de mástil + bandera (16 velas recientes)
+    c_mast = c_arr[-18:-4]
+    idx_min = int(np.argmin(c_mast))
+    idx_max = int(np.argmax(c_mast))
+    rango_mast_atr = (float(np.max(c_mast)) - float(np.min(c_mast))) / denom
+
+    c_flag = c_arr[-5:-1]
+    h_flag = h_arr[-5:-1]
+    l_flag = l_arr[-5:-1]
+    techo_flag = float(np.max(h_flag))
+    piso_flag = float(np.min(l_flag))
+    ancho_flag = max(techo_flag - piso_flag, 1e-6)
+    vol_mast = float(np.mean(v_arr[-14:-4])) if np.mean(v_arr[-14:-4]) > 0 else 1.0
+    vol_flag = float(np.mean(v_arr[-5:-1]))
+    compresion_vol = vol_flag <= (vol_mast * 1.05)
+
+    precio = float(c_arr[-1])
+
+    # Bull Flag: mínimo ocurre antes del máximo dentro del mástil
+    if rango_mast_atr >= 2.0 and idx_max > idx_min:
+        altura_mast = float(np.max(c_mast)) - float(np.min(c_mast))
+        retroceso = (float(np.max(c_mast)) - piso_flag) / max(altura_mast, 1e-6)
+        es_compacta = ancho_flag <= (1.6 * denom) and retroceso <= 0.48
+        if es_compacta:
+            if precio > techo_flag and (rvol >= 1.15 or compresion_vol):
+                return 2.0, "COMPRA FUERTE", f"Ruptura Bull Flag > ${techo_flag:.2f} (mástil {rango_mast_atr:.1f} ATR)", 2.0, "COMPRA"
+            if precio >= piso_flag and compresion_vol:
+                return 1.0, "COMPRA", f"Bull Flag en consolidación [${piso_flag:.2f}-${techo_flag:.2f}]", 1.1, None
+
+    # Bear Flag: máximo ocurre antes del mínimo dentro del mástil
+    if rango_mast_atr >= 2.0 and idx_min > idx_max:
+        altura_mast = float(np.max(c_mast)) - float(np.min(c_mast))
+        retroceso = (techo_flag - float(np.min(c_mast))) / max(altura_mast, 1e-6)
+        es_compacta = ancho_flag <= (1.6 * denom) and retroceso <= 0.48
+        if es_compacta:
+            if precio < piso_flag and (rvol >= 1.15 or compresion_vol):
+                return -2.0, "VENTA FUERTE", f"Ruptura Bear Flag < ${piso_flag:.2f} (mástil {rango_mast_atr:.1f} ATR)", -2.0, "VENTA"
+            if precio <= techo_flag and compresion_vol:
+                return -1.0, "VENTA", f"Bear Flag en consolidación [${piso_flag:.2f}-${techo_flag:.2f}]", -1.1, None
+
+    return 0.0, "NEUTRAL", "Sin bandera definida", 0.0, None
+
+
+def detectar_rebote_sobreventa(
+    df_intra: pd.DataFrame,
+    rsi_serie: pd.Series,
+    bb_pct_b_serie: pd.Series,
+    soporte_1: float,
+    resistencia_1: float,
+    cmf_val: float,
+    rvol: float,
+) -> Tuple[float, str, str, float, Optional[str]]:
+    """
+    Detecta Rebotes confirmados por Sobreventa (en soporte o RSI/BB extremos girando al alza)
+    y simétricamente Rechazos por Sobrecompra.
+    Evita 'atrapar cuchillos': exige confirmación de giro de vela + momentum/flujo.
+    """
+    if len(df_intra) < 8:
+        return 0.0, "NEUTRAL", "Rebote N/D", 0.0, None
+
+    c_actual = _safe_float(df_intra["Close"].iloc[-1])
+    o_actual = _safe_float(df_intra["Open"].iloc[-1])
+    rsi_actual = _safe_float(rsi_serie.iloc[-1], 50.0)
+    rsi_prev_min = _safe_float(rsi_serie.iloc[-6:-1].min(), 50.0)
+    bb_prev_min = _safe_float(bb_pct_b_serie.iloc[-6:-1].min(), 0.5)
+    cerca_s1 = c_actual <= (soporte_1 * 1.02)
+
+    vela_verde = c_actual > o_actual
+    giro_alcista = rsi_actual > (rsi_prev_min + 2.5) and _safe_float(df_intra["Close"].iloc[-1]) > _safe_float(df_intra["Close"].iloc[-2])
+
+    # Rebote por sobreventa confirmado
+    sobreventa_prev = (rsi_prev_min <= 33.0) or (bb_prev_min <= 0.12)
+    if sobreventa_prev and giro_alcista and vela_verde:
+        if (cerca_s1 or cmf_val >= 0.0 or rvol >= 1.2) and rsi_prev_min <= 28.0:
+            return 2.0, "COMPRA FUERTE", f"Rebote Sobreventa confirmado (RSI min {rsi_prev_min:.1f}->{rsi_actual:.1f}, RVOL {rvol:.2f}x)", 1.9, "COMPRA"
+        return 1.0, "COMPRA", f"Rebote desde sobreventa (RSI min {rsi_prev_min:.1f}->{rsi_actual:.1f})", 1.0, None
+
+    # Rechazo por sobrecompra confirmado
+    rsi_prev_max = _safe_float(rsi_serie.iloc[-6:-1].max(), 50.0)
+    bb_prev_max = _safe_float(bb_pct_b_serie.iloc[-6:-1].max(), 0.5)
+    cerca_r1 = c_actual >= (resistencia_1 * 0.98)
+    vela_roja = c_actual < o_actual
+    giro_bajista = rsi_actual < (rsi_prev_max - 2.5) and _safe_float(df_intra["Close"].iloc[-1]) < _safe_float(df_intra["Close"].iloc[-2])
+
+    sobrecompra_prev = (rsi_prev_max >= 69.0) or (bb_prev_max >= 0.88)
+    if sobrecompra_prev and giro_bajista and vela_roja:
+        if (cerca_r1 or cmf_val <= 0.0 or rvol >= 1.2) and rsi_prev_max >= 73.0:
+            return -2.0, "VENTA FUERTE", f"Rechazo Sobrecompra (RSI max {rsi_prev_max:.1f}->{rsi_actual:.1f}, RVOL {rvol:.2f}x)", -1.9, "VENTA"
+        return -1.0, "VENTA", f"Giro desde sobrecompra (RSI max {rsi_prev_max:.1f}->{rsi_actual:.1f})", -1.0, None
+
+    return 0.0, "NEUTRAL", f"Sin rebote/rechazo extremo (RSI={rsi_actual:.1f})", 0.0, None
+
+
+def evaluar_tendencia_diaria_squeeze(
+    df_diario: Optional[pd.DataFrame],
+    precio_actual: float,
+) -> Tuple[float, str, str, float, Optional[str]]:
+    """
+    Evalúa el marco diario (SMA 20/50 + compresión de volatilidad BB vs Keltner Squeeze)
+    para alinear operaciones swing y filtrar ruido intradía.
+    """
+    if df_diario is None or len(df_diario) < 25:
+        return 0.0, "NEUTRAL", "Tendencia diaria insuficiente", 0.0, None
+
+    d_close = df_diario["Close"].astype(float)
+    d_high = df_diario["High"].astype(float)
+    d_low = df_diario["Low"].astype(float)
+    sma20 = _safe_float(d_close.rolling(20).mean().iloc[-1], precio_actual)
+    sma50 = _safe_float(d_close.rolling(min(50, len(d_close))).mean().iloc[-1], sma20)
+
+    # Detección de Squeeze (ancho BB estrecho frente a ATR diario)
+    std20 = _safe_float(d_close.rolling(20).std(ddof=0).iloc[-1], 0.0)
+    atr_d = _safe_float(calcular_atr(d_high, d_low, d_close, 14).iloc[-1], precio_actual * 0.015)
+    squeeze_activo = (2.0 * std20) < (1.55 * max(atr_d, 1e-4))
+    expansion_hoy = _safe_float(d_close.iloc[-1] - d_close.iloc[-2], 0.0)
+
+    if precio_actual > sma20 > sma50:
+        if squeeze_activo and expansion_hoy > 0:
+            return 2.0, "COMPRA FUERTE", f"Tendencia Diaria Alcista + Squeeze Release (SMA20 ${sma20:.2f} > SMA50 ${sma50:.2f})", 2.0, "COMPRA"
+        return 1.0, "COMPRA", f"Tendencia Diaria Alcista (P>${sma20:.2f}>SMA50 ${sma50:.2f})", 1.0, None
+
+    if precio_actual < sma20 < sma50:
+        if squeeze_activo and expansion_hoy < 0:
+            return -2.0, "VENTA FUERTE", f"Tendencia Diaria Bajista + Squeeze Breakdown (SMA20 ${sma20:.2f} < SMA50 ${sma50:.2f})", -2.0, "VENTA"
+        return -1.0, "VENTA", f"Tendencia Diaria Bajista (P<${sma20:.2f}<SMA50 ${sma50:.2f})", -1.0, None
+
+    if precio_actual > sma20:
+        return 0.5, "COMPRA", f"Sobre SMA20 diaria (${sma20:.2f})", 0.5, None
+    if precio_actual < sma20:
+        return -0.5, "VENTA", f"Bajo SMA20 diaria (${sma20:.2f})", -0.5, None
+    return 0.0, "NEUTRAL", f"Consolidación en SMA20 (${sma20:.2f})", 0.0, None
+
+
 # ==============================================================================
-# 3. GESTOR PRINCIPAL DE DATOS E INDICADORES
+# 3. GESTOR PRINCIPAL DEL ESCÁNER (`ScannerMercado`)
 # ==============================================================================
 
-class GestorIndicadores:
+class ScannerMercado:
     """
-    Coordina la descarga por lotes de precios/velas, enriquecimiento asíncrono de P/E y fundamentales,
-    cálculo de los 13 indicadores y filtrado de oportunidades de alto potencial/certeza.
+    Descarga velas intradía y diarias por lotes, fundamentales, fechas de próximos
+    reportes e ingresos esperados/reportados, y calcula 17 indicadores técnicos/patrones.
     """
 
     def __init__(
@@ -372,7 +677,8 @@ class GestorIndicadores:
         self._lock = threading.RLock()
         self._snapshots_actuales: Dict[str, AnalisisTecnicoTicker] = {}
         self._historial_ticker: Dict[str, List[AnalisisTecnicoTicker]] = {t: [] for t in self.tickers}
-        self._cache_fundamentales: Dict[str, Tuple[float, Dict[str, Optional[float]]]] = {}
+        self._cache_fundamentales: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+        self._cache_reportes: Dict[str, DatosReporteResultados] = {}
         self._ultimo_evento_emitido: Dict[str, Tuple[float, str]] = {}
 
         self._detener = threading.Event()
@@ -380,16 +686,14 @@ class GestorIndicadores:
         self._hilo_fundamentales: Optional[threading.Thread] = None
 
     # ------------------------------------------------------------------
-    # 1. CACHÉ ASÍNCRONO DE FUNDAMENTALES (P/E, CAP. MERCADO, 52W, BETA)
+    # 1. CACHÉ ASÍNCRONO DE FUNDAMENTALES Y REPORTES DE RESULTADOS
     # ------------------------------------------------------------------
 
-    def _obtener_fundamentales_cacheados(self, ticker: str) -> Dict[str, Optional[float]]:
-        """Devuelve fundamentales desde memoria (refrescados en segundo plano cada 30 min)."""
+    def _obtener_fundamentales_cacheados(self, ticker: str) -> Dict[str, Any]:
         with self._lock:
             entrada = self._cache_fundamentales.get(ticker)
-            if entrada is not None:
-                return entrada[1]
-        return {
+            rep = self._cache_reportes.get(ticker)
+        base = dict(entrada[1]) if entrada is not None else {
             "pe_ratio": None,
             "pe_forward": None,
             "cap_mercado_b": None,
@@ -397,20 +701,191 @@ class GestorIndicadores:
             "min_52s": None,
             "beta": None,
         }
+        base["reporte_resultados"] = rep
+        return base
+
+    @staticmethod
+    def _extraer_datos_reporte_ticker(tk_usr: str, tk_obj: yf.Ticker, info: Dict[str, Any]) -> DatosReporteResultados:
+        """
+        Extrae fecha del próximo reporte, último reporte, ingresos esperados,
+        ingresos reales reportados, EPS esperado/reportado y evaluación conjunta base.
+        """
+        ahora_date = datetime.now().date()
+        fecha_prox: Optional[str] = None
+        dias_hasta: Optional[int] = None
+        fecha_ult: Optional[str] = None
+        eps_esp: Optional[float] = None
+        eps_rep: Optional[float] = None
+        eps_sorp: Optional[float] = None
+        ing_esp: Optional[float] = None
+        ing_rep: Optional[float] = None
+        ing_yoy: Optional[float] = None
+
+        # 1. earnings_dates distingue con precisión filas futuras (Reported EPS == NaN) vs pasadas
+        try:
+            ed = tk_obj.earnings_dates
+            if ed is not None and not ed.empty:
+                ed = ed.sort_index(ascending=False)
+                futuras: List[Tuple[datetime.date, Optional[float]]] = []
+                pasadas: List[Tuple[datetime.date, Optional[float], Optional[float], Optional[float]]] = []
+                for idx_ts, row in ed.iterrows():
+                    try:
+                        d_row = pd.Timestamp(idx_ts).date()
+                    except Exception:
+                        continue
+                    e_est = _safe_opt_float(row.get("EPS Estimate"))
+                    e_rep = _safe_opt_float(row.get("Reported EPS"))
+                    e_srp = _safe_opt_float(row.get("Surprise(%)"))
+                    if e_rep is None and d_row >= ahora_date:
+                        futuras.append((d_row, e_est))
+                    elif e_rep is not None:
+                        pasadas.append((d_row, e_est, e_rep, e_srp))
+
+                if futuras:
+                    futuras.sort(key=lambda x: x[0])
+                    fecha_prox = futuras[0][0].isoformat()
+                    dias_hasta = (futuras[0][0] - ahora_date).days
+                    if futuras[0][1] is not None:
+                        eps_esp = round(futuras[0][1], 3)
+
+                if pasadas:
+                    pasadas.sort(key=lambda x: x[0], reverse=True)
+                    d_ult, e_u_est, e_u_rep, e_u_srp = pasadas[0]
+                    fecha_ult = d_ult.isoformat()
+                    eps_rep = round(e_u_rep, 3) if e_u_rep is not None else None
+                    if eps_esp is None and e_u_est is not None:
+                        eps_esp = round(e_u_est, 3)
+                    if e_u_srp is not None:
+                        eps_sorp = round(e_u_srp, 2)
+                    elif e_u_est is not None and abs(e_u_est) > 1e-6 and e_u_rep is not None:
+                        eps_sorp = round(((e_u_rep - e_u_est) / abs(e_u_est)) * 100.0, 2)
+        except Exception:
+            pass
+
+        # 2. calendar aporta Revenue Average y fallback de próxima fecha/EPS esperado
+        try:
+            cal = tk_obj.calendar or {}
+            if isinstance(cal, dict):
+                ing_esp = _safe_opt_float(cal.get("Revenue Average"))
+                if eps_esp is None:
+                    val_eps_cal = _safe_opt_float(cal.get("Earnings Average"))
+                    if val_eps_cal is not None:
+                        eps_esp = round(val_eps_cal, 3)
+                if fecha_prox is None:
+                    edates = cal.get("Earnings Date") or []
+                    if isinstance(edates, list) and edates:
+                        d_cal = pd.Timestamp(edates[0]).date()
+                        if d_cal >= ahora_date:
+                            fecha_prox = d_cal.isoformat()
+                            dias_hasta = (d_cal - ahora_date).days
+                        elif fecha_ult is None:
+                            fecha_ult = d_cal.isoformat()
+        except Exception:
+            pass
+
+        # 3. revenue_estimate fallback para ingresos esperados del trimestre actual ('0q')
+        if ing_esp is None:
+            try:
+                re_df = tk_obj.revenue_estimate
+                if re_df is not None and not re_df.empty and "avg" in re_df.columns:
+                    if "0q" in re_df.index:
+                        ing_esp = _safe_opt_float(re_df.loc["0q", "avg"])
+                    else:
+                        ing_esp = _safe_opt_float(re_df["avg"].iloc[0])
+            except Exception:
+                pass
+
+        # 4. quarterly_income_stmt aporta los ingresos reales más recientes reportados y YoY
+        try:
+            qis = tk_obj.quarterly_income_stmt
+            if qis is not None and not qis.empty and "Total Revenue" in qis.index:
+                serie_rev = qis.loc["Total Revenue"].dropna()
+                if len(serie_rev) >= 1:
+                    ing_rep = _safe_opt_float(serie_rev.iloc[0])
+                    if fecha_ult is None:
+                        try:
+                            fecha_ult = pd.Timestamp(serie_rev.index[0]).date().isoformat()
+                        except Exception:
+                            pass
+                    if len(serie_rev) >= 5:
+                        rev_yoy_base = _safe_opt_float(serie_rev.iloc[4])
+                        if ing_rep is not None and rev_yoy_base is not None and abs(rev_yoy_base) > 1e-6:
+                            ing_yoy = round(((ing_rep - rev_yoy_base) / abs(rev_yoy_base)) * 100.0, 2)
+        except Exception:
+            pass
+
+        if ing_yoy is None:
+            rev_g = _safe_opt_float(info.get("revenueGrowth"))
+            if rev_g is not None:
+                ing_yoy = round(rev_g * 100.0, 2)
+        if ing_rep is None:
+            ing_rep = _safe_opt_float(info.get("totalRevenue"))
+
+        # Sorpresa relativa entre ingresos reales últimos vs consenso esperado actual/reciente (si aplica)
+        ing_sorp: Optional[float] = None
+        if ing_rep is not None and ing_esp is not None and ing_esp > 0 and dias_hasta is None:
+            ing_sorp = round(((ing_rep - ing_esp) / ing_esp) * 100.0, 2)
+
+        # Evaluación sintética del reporte
+        eval_rep = "PENDIENTE"
+        if dias_hasta is not None and 0 <= dias_hasta <= 10:
+            eval_rep = "PROXIMO_INMINENTE"
+        elif eps_sorp is not None:
+            if eps_sorp >= 4.0 and (ing_yoy is None or ing_yoy >= 0.0):
+                eval_rep = "POSITIVO"
+            elif eps_sorp <= -4.0 or (ing_yoy is not None and ing_yoy <= -6.0):
+                eval_rep = "NEGATIVO"
+            else:
+                eval_rep = "MIXTO"
+        elif ing_yoy is not None:
+            eval_rep = "POSITIVO" if ing_yoy >= 8.0 else ("NEGATIVO" if ing_yoy <= -5.0 else "MIXTO")
+
+        partes_res: List[str] = []
+        if fecha_prox:
+            d_txt = f" ({dias_hasta}d)" if dias_hasta is not None else ""
+            partes_res.append(f"Próx. reporte: {fecha_prox}{d_txt}")
+        if ing_esp is not None:
+            partes_res.append(f"Ing. esp: {formatear_monto_compacto(ing_esp)}")
+        if ing_rep is not None:
+            yoy_txt = f" ({ing_yoy:+.1f}% YoY)" if ing_yoy is not None else ""
+            partes_res.append(f"Ing. rep: {formatear_monto_compacto(ing_rep)}{yoy_txt}")
+        if eps_rep is not None:
+            srp_txt = f" ({eps_sorp:+.1f}% sorp)" if eps_sorp is not None else ""
+            partes_res.append(f"EPS rep: {eps_rep:.2f}{srp_txt}")
+        elif eps_esp is not None:
+            partes_res.append(f"EPS esp: {eps_esp:.2f}")
+
+        return DatosReporteResultados(
+            ticker=tk_usr,
+            fecha_proximo_reporte=fecha_prox,
+            dias_hasta_reporte=dias_hasta,
+            fecha_ultimo_reporte=fecha_ult,
+            ingresos_esperados=ing_esp,
+            ingresos_reportados=ing_rep,
+            ingresos_crecimiento_yoy_pct=ing_yoy,
+            ingresos_sorpresa_pct=ing_sorp,
+            eps_esperado=eps_esp,
+            eps_reportado=eps_rep,
+            eps_sorpresa_pct=eps_sorp,
+            evaluacion_reporte=eval_rep,
+            resumen_reporte=" | ".join(partes_res) if partes_res else "Sin calendario/estimados publicados",
+            actualizado_epoch=time.time(),
+        )
 
     def _refrescar_fundamentales_worker(self) -> None:
-        """Enriquece P/E, Market Cap y Beta en paralelo sin bloquear jamás el motor de velas."""
-        def _consultar_uno(tk_usr: str) -> Tuple[str, Dict[str, Optional[float]]]:
+        """Enriquece P/E, Market Cap, Beta y Reportes de Resultados en paralelo sin bloquear velas."""
+        def _consultar_uno(tk_usr: str) -> Tuple[str, Dict[str, Any], Optional[DatosReporteResultados]]:
             try:
                 sym = simbolo_yfinance(tk_usr)
-                info = yf.Ticker(sym).info or {}
+                tk_obj = yf.Ticker(sym)
+                info = tk_obj.info or {}
                 pe = info.get("trailingPE")
                 fpe = info.get("forwardPE")
                 mcap = info.get("marketCap")
                 hi52 = info.get("fiftyTwoWeekHigh")
                 lo52 = info.get("fiftyTwoWeekLow")
                 beta = info.get("beta")
-                return tk_usr, {
+                datos_f = {
                     "pe_ratio": round(float(pe), 2) if pe is not None else None,
                     "pe_forward": round(float(fpe), 2) if fpe is not None else None,
                     "cap_mercado_b": round(float(mcap) / 1e9, 2) if mcap is not None else None,
@@ -418,6 +893,8 @@ class GestorIndicadores:
                     "min_52s": round(float(lo52), 2) if lo52 is not None else None,
                     "beta": round(float(beta), 2) if beta is not None else None,
                 }
+                rep = self._extraer_datos_reporte_ticker(tk_usr, tk_obj, info)
+                return tk_usr, datos_f, rep
             except Exception:
                 return tk_usr, {
                     "pe_ratio": None,
@@ -426,7 +903,7 @@ class GestorIndicadores:
                     "max_52s": None,
                     "min_52s": None,
                     "beta": None,
-                }
+                }, None
 
         while not self._detener.is_set():
             ahora = time.time()
@@ -448,14 +925,48 @@ class GestorIndicadores:
                     for fut_f in futuros_f:
                         if self._detener.is_set():
                             break
-                        tk_res, datos_f = fut_f.result()
+                        tk_res, datos_f, rep_res = fut_f.result()
                         with self._lock:
                             self._cache_fundamentales[tk_res] = (time.time(), datos_f)
+                            if rep_res is not None:
+                                self._cache_reportes[tk_res] = rep_res
+                                snap_act = self._snapshots_actuales.get(tk_res)
+                                if snap_act is not None:
+                                    snap_act.datos_financieros.reporte_resultados = rep_res
                 finally:
                     pool.shutdown(wait=not self._detener.is_set(), cancel_futures=True)
-                self._detener.wait(timeout=1.0)
+                self._detener.wait(timeout=0.8)
 
             self._detener.wait(timeout=60.0)
+
+    def obtener_o_consultar_reporte_puntual(self, ticker: str) -> Optional[DatosReporteResultados]:
+        """Devuelve el reporte de resultados en caché o lo descarga puntualmente para análisis conjunto."""
+        tk = ticker.strip().upper()
+        with self._lock:
+            rep = self._cache_reportes.get(tk)
+            if rep is not None and (time.time() - rep.actualizado_epoch) < 1800:
+                return rep
+        try:
+            sym = simbolo_yfinance(tk)
+            tk_obj = yf.Ticker(sym)
+            info = tk_obj.info or {}
+            rep_nuevo = self._extraer_datos_reporte_ticker(tk, tk_obj, info)
+            with self._lock:
+                self._cache_reportes[tk] = rep_nuevo
+                if tk in self._snapshots_actuales:
+                    self._snapshots_actuales[tk].datos_financieros.reporte_resultados = rep_nuevo
+            return rep_nuevo
+        except Exception:
+            return rep
+
+    def obtener_reporte_resultados(self, ticker: str) -> Optional[DatosReporteResultados]:
+        tk = ticker.strip().upper()
+        with self._lock:
+            return self._cache_reportes.get(tk)
+
+    def obtener_reportes_resultados_todos(self) -> Dict[str, DatosReporteResultados]:
+        with self._lock:
+            return dict(self._cache_reportes)
 
     # ------------------------------------------------------------------
     # 2. EXTRACCIÓN SEGURA DE DATAFRAME POR TICKER DESDE LOTE YFINANCE
@@ -493,7 +1004,7 @@ class GestorIndicadores:
             return None
 
     # ------------------------------------------------------------------
-    # 3. EVALUACIÓN COMPLETA DE LOS 13 INDICADORES Y REGLAS DE ALARMA
+    # 3. EVALUACIÓN COMPLETA DE LOS 17 INDICADORES + PATRONES SWING
     # ------------------------------------------------------------------
 
     def _evaluar_ticker_dataframe(
@@ -502,7 +1013,7 @@ class GestorIndicadores:
         df_intra: pd.DataFrame,
         df_diario: Optional[pd.DataFrame],
     ) -> AnalisisTecnicoTicker:
-        """Calcula datos financieros, niveles S/R, los 13 indicadores y el score de certeza."""
+        """Calcula datos financieros, niveles S/R, los 17 indicadores/patrones y el score de certeza."""
         high = df_intra["High"].astype(float)
         low = df_intra["Low"].astype(float)
         close = df_intra["Close"].astype(float)
@@ -520,7 +1031,6 @@ class GestorIndicadores:
             cierre_previo = _safe_float(d_close.iloc[-2], _safe_float(close.iloc[0], precio_actual))
             cambio_pct = ((precio_actual - cierre_previo) / max(cierre_previo, 1e-6)) * 100.0
 
-            # Pivote clásico de la sesión previa combinado con swing reciente de 20 sesiones
             h_prev = _safe_float(d_high.iloc[-2], _safe_float(high.max()))
             l_prev = _safe_float(d_low.iloc[-2], _safe_float(low.min()))
             pivote = (h_prev + l_prev + cierre_previo) / 3.0
@@ -568,12 +1078,15 @@ class GestorIndicadores:
             max_52_semanas=fund["max_52s"] or max_52_calc,
             min_52_semanas=fund["min_52s"] or min_52_calc,
             beta=fund["beta"],
+            reporte_resultados=fund.get("reporte_resultados"),
         )
 
         indicadores: List[ResultadoIndicador] = []
+        patrones_detectados: List[str] = []
 
         # --- 1. Oscilador (contrarian) | RSI(14) | cortes 20/35/65/80 ---
-        rsi_val = calcular_rsi(close, 14)
+        rsi_serie = calcular_rsi_serie(close, 14)
+        rsi_val = _safe_float(rsi_serie.iloc[-1], 50.0)
         if rsi_val <= 20.0:
             ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
         elif rsi_val <= 35.0:
@@ -607,7 +1120,8 @@ class GestorIndicadores:
         ))
 
         # --- 3. Oscilador (contrarian) | Bollinger %B(20,2) | cortes 0/0.2/0.8/1 ---
-        bb_pct_b = calcular_bollinger_pct_b(close, 20, 2.0)
+        bb_serie = calcular_bollinger_pct_b_serie(close, 20, 2.0)
+        bb_pct_b = _safe_float(bb_serie.iloc[-1], 0.5)
         if bb_pct_b <= 0.0:
             ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
         elif bb_pct_b <= 0.2:
@@ -703,8 +1217,8 @@ class GestorIndicadores:
             f"Z={vwap_z:+.2f} (VWAP=${vwap_sesion:.2f})", ev, pts, alm,
         ))
 
-        # --- 8. Tendencia | ADX/DI | DI+ − DI−, vale 0 si ADX < 20 ---
-        adx_val, di_pos, di_neg, spread_di = calcular_adx_di(high, low, close, 14)
+        # --- 8. Tendencia | ADX/DI | DI+ - DI-, vale 0 si ADX < 20 ---
+        adx_val, _di_pos, _di_neg, spread_di = calcular_adx_di(high, low, close, 14)
         if spread_di >= 15.0:
             ev, pts, alm = "COMPRA FUERTE", 2.0, "COMPRA"
         elif spread_di >= 5.0:
@@ -715,10 +1229,9 @@ class GestorIndicadores:
             ev, pts, alm = "VENTA", -1.0, None
         else:
             ev, pts, alm = "VENTA FUERTE", -2.0, "VENTA"
-        etiqueta_adx = f"{spread_di:+.2f} (ADX={adx_val:.1f})"
         indicadores.append(ResultadoIndicador(
             "Tendencia", "ADX/DI (DI+-DI-)", round(spread_di, 2),
-            etiqueta_adx, ev, pts, alm,
+            f"{spread_di:+.2f} (ADX={adx_val:.1f})", ev, pts, alm,
         ))
 
         # --- 9. Supertrend(10,2.5)/ATR ---
@@ -798,12 +1311,14 @@ class GestorIndicadores:
         if precio_actual > resistencia_1 and rvol >= 1.2:
             ev, pts, alm = "COMPRA FUERTE", 1.8, "COMPRA"
             txt_sr = f"BOS Alcista > R1(${resistencia_1:.2f})"
+            patrones_detectados.append("Ruptura BOS Alcista")
         elif pos_sr <= 0.18:
             ev, pts, alm = "COMPRA", 1.1, "COMPRA"
             txt_sr = f"Zona Soporte S1(${soporte_1:.2f})"
         elif precio_actual < soporte_1 and rvol >= 1.2:
             ev, pts, alm = "VENTA FUERTE", -1.8, "VENTA"
             txt_sr = f"BOS Bajista < S1(${soporte_1:.2f})"
+            patrones_detectados.append("Ruptura BOS Bajista")
         elif pos_sr >= 0.85:
             ev, pts, alm = "VENTA", -1.0, None
             txt_sr = f"Zona Resistencia R1(${resistencia_1:.2f})"
@@ -815,21 +1330,71 @@ class GestorIndicadores:
             txt_sr, ev, pts, alm,
         ))
 
+        # --- 14. Acción de Precio | Ruptura de Rango de Apertura (ORB) ---
+        v_orb, ev_orb, txt_orb, pts_orb, alm_orb = calcular_ruptura_orb(df_intra, precio_actual, atr_14, rvol)
+        indicadores.append(ResultadoIndicador(
+            "Acción Precio", "Ruptura Rango Apertura (ORB)", round(v_orb, 3),
+            txt_orb, ev_orb, pts_orb, alm_orb,
+        ))
+        if alm_orb == "COMPRA":
+            patrones_detectados.append("ORB Alcista")
+        elif alm_orb == "VENTA":
+            patrones_detectados.append("ORB Bajista")
+
+        # --- 15. Patrón Chartista | Bandera (Bull/Bear Flag) ---
+        v_flg, ev_flg, txt_flg, pts_flg, alm_flg = detectar_patron_bandera(high, low, close, volume, atr_14, rvol)
+        indicadores.append(ResultadoIndicador(
+            "Patrón Chartista", "Patrón Bandera (Flag)", round(v_flg, 2),
+            txt_flg, ev_flg, pts_flg, alm_flg,
+        ))
+        if ev_flg == "COMPRA FUERTE":
+            patrones_detectados.append("Bandera Alcista (Bull Flag)")
+        elif ev_flg == "COMPRA":
+            patrones_detectados.append("Bull Flag Formando")
+        elif ev_flg == "VENTA FUERTE":
+            patrones_detectados.append("Bandera Bajista (Bear Flag)")
+        elif ev_flg == "VENTA":
+            patrones_detectados.append("Bear Flag Formando")
+
+        # --- 16. Reversión Swing | Rebote Sobreventa / Rechazo Sobrecompra ---
+        v_reb, ev_reb, txt_reb, pts_reb, alm_reb = detectar_rebote_sobreventa(
+            df_intra, rsi_serie, bb_serie, soporte_1, resistencia_1, cmf_val, rvol
+        )
+        indicadores.append(ResultadoIndicador(
+            "Reversión Swing", "Rebote Sobreventa/Sobrecompra", round(v_reb, 2),
+            txt_reb, ev_reb, pts_reb, alm_reb,
+        ))
+        if alm_reb == "COMPRA":
+            patrones_detectados.append("Rebote Sobreventa Confirmado")
+        elif alm_reb == "VENTA":
+            patrones_detectados.append("Rechazo Sobrecompra")
+
+        # --- 17. Marco Diario | Tendencia SMA 20/50 & Squeeze ---
+        v_td, ev_td, txt_td, pts_td, alm_td = evaluar_tendencia_diaria_squeeze(df_diario, precio_actual)
+        indicadores.append(ResultadoIndicador(
+            "Marco Diario", "Tendencia Diaria SMA20/50 + Squeeze", round(v_td, 2),
+            txt_td, ev_td, pts_td, alm_td,
+        ))
+        if alm_td == "COMPRA":
+            patrones_detectados.append("Squeeze Release Alcista Diario")
+        elif alm_td == "VENTA":
+            patrones_detectados.append("Squeeze Breakdown Bajista Diario")
+
         # --- SÍNTESIS DE CONFLUENCIA, EVALUACIÓN GENERAL Y CERTEZA ---
         alarmas_compra = [ind.nombre for ind in indicadores if ind.alarma == "COMPRA"]
         alarmas_venta = [ind.nombre for ind in indicadores if ind.alarma == "VENTA"]
 
         suma_puntaje = sum(ind.puntaje for ind in indicadores)
-        max_teorico = 24.0
+        max_teorico = 32.0
         indice_neto = suma_puntaje / max_teorico  # [-1.0, +1.0]
 
-        if indice_neto >= 0.30:
+        if indice_neto >= 0.28:
             eval_general = "COMPRA FUERTE"
             dir_potencial = "ALCISTA"
         elif indice_neto >= 0.11:
             eval_general = "COMPRA"
             dir_potencial = "ALCISTA"
-        elif indice_neto <= -0.30:
+        elif indice_neto <= -0.28:
             eval_general = "VENTA FUERTE"
             dir_potencial = "BAJISTA"
         elif indice_neto <= -0.11:
@@ -839,25 +1404,24 @@ class GestorIndicadores:
             eval_general = "NEUTRAL"
             dir_potencial = "NEUTRAL"
 
-        # Nivel de certeza y potencial: combina magnitud del consenso + número de alarmas alineadas + volumen institucional
         n_alarmas_favor = len(alarmas_compra) if dir_potencial == "ALCISTA" else (len(alarmas_venta) if dir_potencial == "BAJISTA" else 0)
         n_alarmas_contra = len(alarmas_venta) if dir_potencial == "ALCISTA" else (len(alarmas_compra) if dir_potencial == "BAJISTA" else 0)
         respaldo_institucional = 8.0 if ((dir_potencial == "ALCISTA" and cmf_val > 0.05) or (dir_potencial == "BAJISTA" and cmf_val < -0.05)) else 0.0
         respaldo_rvol = min(10.0, max(0.0, (rvol - 1.0) * 8.0))
+        bonus_patrones = min(12.0, len(patrones_detectados) * 5.0)
 
         potencial_score = min(
             100.0,
-            abs(indice_neto) * 115.0 + n_alarmas_favor * 9.5 + respaldo_institucional + respaldo_rvol - n_alarmas_contra * 6.0,
+            abs(indice_neto) * 115.0 + n_alarmas_favor * 8.5 + respaldo_institucional + respaldo_rvol + bonus_patrones - n_alarmas_contra * 7.0,
         )
         potencial_score = round(max(0.0, potencial_score), 1)
 
         certeza_pct = min(
             98.0,
-            42.0 + abs(indice_neto) * 65.0 + n_alarmas_favor * 6.5 + respaldo_institucional * 0.8 - n_alarmas_contra * 8.0,
-        ) if dir_potencial != "NEUTRAL" else 30.0
+            40.0 + abs(indice_neto) * 65.0 + n_alarmas_favor * 5.8 + respaldo_institucional * 0.8 + bonus_patrones * 0.5 - n_alarmas_contra * 8.5,
+        ) if dir_potencial != "NEUTRAL" else 28.0
         certeza_pct = round(max(15.0, certeza_pct), 1)
 
-        # Filtro estricto de evento de alto potencial según modo ("spot" vs "short y long")
         operacion_compatible = (
             dir_potencial == "ALCISTA"
             or (dir_potencial == "BAJISTA" and "short" in self.modo_operacion)
@@ -872,7 +1436,8 @@ class GestorIndicadores:
         motivo = ""
         if es_alto_potencial:
             lista_alm = ", ".join((alarmas_compra if dir_potencial == "ALCISTA" else alarmas_venta)[:4])
-            motivo = f"{eval_general} ({certeza_pct:.0f}% certeza) | Alarmas: {lista_alm}"
+            pat_txt = f" | Patrones: {', '.join(patrones_detectados[:2])}" if patrones_detectados else ""
+            motivo = f"{eval_general} ({certeza_pct:.0f}% certeza) | Alarmas: {lista_alm}{pat_txt}"
 
         return AnalisisTecnicoTicker(
             ticker=ticker,
@@ -886,6 +1451,7 @@ class GestorIndicadores:
             certeza_pct=certeza_pct,
             alarmas_compra=alarmas_compra,
             alarmas_venta=alarmas_venta,
+            patrones_detectados=patrones_detectados,
             es_evento_alto_potencial=es_alto_potencial,
             motivo_evento=motivo,
         )
@@ -897,12 +1463,11 @@ class GestorIndicadores:
     def actualizar_todos_los_tickers(self) -> Dict[str, AnalisisTecnicoTicker]:
         """
         Descarga velas intradía (15m, 5d) y diarias (1d, 3mo) en lotes vectorizados rápidos,
-        actualiza los indicadores de toda la lista y emite eventos de alto potencial a `/datos`.
+        actualiza los 17 indicadores de toda la lista y emite eventos de alto potencial a `/d`.
         """
         mapa_yf = {t: simbolo_yfinance(t) for t in self.tickers}
         simbolos_yf = list(dict.fromkeys(mapa_yf.values()))
 
-        # Cachear descarga diaria cada 15 min para máxima velocidad
         ahora = time.time()
         if not hasattr(self, "_cache_df_diario") or (ahora - getattr(self, "_ts_df_diario", 0.0)) > 900:
             try:
@@ -919,7 +1484,6 @@ class GestorIndicadores:
             except Exception:
                 self._cache_df_diario = pd.DataFrame()
 
-        # Descarga intradía fresca en sub-lotes de 35 símbolos para máxima estabilidad de red
         resultados_ciclo: Dict[str, AnalisisTecnicoTicker] = {}
         paso = 35
         for idx in range(0, len(self.tickers), paso):
@@ -954,7 +1518,6 @@ class GestorIndicadores:
                 except Exception:
                     continue
 
-        # Guardar en memoria e historial reciente para ventana de contexto de IA
         eventos_a_notificar: List[AnalisisTecnicoTicker] = []
         with self._lock:
             for tk, an in resultados_ciclo.items():
@@ -966,8 +1529,7 @@ class GestorIndicadores:
 
                 if an.es_evento_alto_potencial:
                     prev = self._ultimo_evento_emitido.get(tk)
-                    # Evitar repetir el mismo evento en `/datos` cada 35s si no cambió dirección o pasaron 4 min
-                    if prev is None or prev[1] != an.evaluacion_general or (ahora - prev[0]) >= 240:
+                    if prev is None or prev[1] != an.evaluacion_general or (ahora - prev[0]) >= 300:
                         self._ultimo_evento_emitido[tk] = (ahora, an.evaluacion_general)
                         eventos_a_notificar.append(an)
 
@@ -982,7 +1544,7 @@ class GestorIndicadores:
         return resultados_ciclo
 
     def consultar_ticker_puntual(self, ticker: str) -> Optional[AnalisisTecnicoTicker]:
-        """Obtiene el snapshot más reciente o fuerza cálculo puntual inmediato para una noticia urgente."""
+        """Obtiene el snapshot más reciente o fuerza cálculo puntual inmediato."""
         tk = ticker.strip().upper()
         with self._lock:
             existente = self._snapshots_actuales.get(tk)
@@ -1022,7 +1584,7 @@ class GestorIndicadores:
         with self._lock:
             return dict(self._snapshots_actuales)
 
-    def obtener_mapa_precios_y_pe(self) -> Dict[str, Dict[str, Optional[float]]]:
+    def obtener_mapa_precios_y_pe(self) -> Dict[str, Dict[str, Any]]:
         """Entrega precios actuales, P/E y S/R de todos los activos para valoración en vivo de `cartera.py`."""
         with self._lock:
             return {
@@ -1039,13 +1601,13 @@ class GestorIndicadores:
             }
 
     def iniciar_monitoreo_continuo(self, callback_ciclo_precios: Optional[Callable[[Dict[str, Dict]], None]] = None) -> None:
-        """Lanza el hilo continuo de cálculo cuantitativo y el hilo asíncrono de fundamentales."""
+        """Lanza el hilo continuo de cálculo cuantitativo y el hilo asíncrono de fundamentales/reportes."""
         self._detener.clear()
 
         if self._hilo_fundamentales is None or not self._hilo_fundamentales.is_alive():
             self._hilo_fundamentales = threading.Thread(
                 target=self._refrescar_fundamentales_worker,
-                name="FundamentalesThread",
+                name="FundamentalesReportesThread",
                 daemon=True,
             )
             self._hilo_fundamentales.start()
@@ -1063,10 +1625,14 @@ class GestorIndicadores:
         if self._hilo_ciclo is None or not self._hilo_ciclo.is_alive():
             self._hilo_ciclo = threading.Thread(
                 target=_bucle,
-                name="IndicadoresThread",
+                name="ScannerCuantitativoThread",
                 daemon=True,
             )
             self._hilo_ciclo.start()
 
     def detener(self) -> None:
         self._detener.set()
+
+
+# Alias de compatibilidad hacia atrás
+GestorIndicadores = ScannerMercado

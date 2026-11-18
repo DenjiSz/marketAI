@@ -5,21 +5,18 @@ analisis_ai.py
 Módulo central de inteligencia artificial con:
 1. Método de Consulta Múltiple (Multi-Ticker Batching):
    Evalúa hasta 6 empresas interrelacionadas en una sola llamada al modelo combinando:
-   - Ventana de contexto específico (noticias 48h/en vivo, 13 indicadores + snapshots,
-     fundamentales P/E-S/R y peso en cartera) POR CADA empresa del lote.
-   - Ventana unificada de contexto general de mercado (tasas de interés Fed, inflación,
-     conflictos geopolíticos entre países y noticias sectoriales: tecnológico, semiconductores/IA/RAM,
-     financiero, salud, consumo, energía/defensa).
-2. Smart Gatekeeper Anti-Neutrales (reducción agresiva de consultas inútiles):
-   - Matriz de confluencia multi-señal (Indicadores + Noticias alineados, Ruptura + RVOL real >= 1.35x,
-     propagación por noticias sectoriales entre empresas pares).
-   - Sensibilidad dinámica por horario de mercado ET (permisivo en pre-market apertura, apertura
-     y pre-cierre; estricto en media sesión o mercado cerrado).
-   - Cooldown extendido tras veredictos neutrales, huella de estado y rate limiter global.
-3. Soporte completo para los 10 modelos configurables y sus niveles de esfuerzo (`thinking_level` / `effort`):
-   - Gemini (`flash3.6`, `flash3.7`, `flash3.8`, `argon`, `hydrogen`, `carbon`, `pro3.1`) vía `google-genai`
-     `client.interactions.create(...)` con `generation_config={"thinking_level": ...}`.
-   - Claude (`sonnet`, `opus`, `fable`) vía `https://api.anthropic.com/v1/messages` con `output_config={"effort": ...}`.
+   - Ventana unificada de Contexto General de Mercado (FED, MACROECONOMIA, Congresos y Sectores).
+   - Ventana de contexto específica por cada empresa del lote con las 6 secciones de `analisis.py`
+     (NOTICIAS, FILINGS_8K, REPORTES_RESULTADOS conjunto con `scanner.py`, DIVULGACIONES_CONGRESO,
+     FED y MACROECONOMIA) y los 17 indicadores/patrones cuantitativos de `scanner.py`.
+2. Smart Gatekeeper Anti-Day-Trading y Anti-Neutrales (reducción agresiva de consultas):
+   - Matriz de evidencia multi-pilar (Técnico/Patrones + Noticias + 8-K/Resultados + Congreso + Sector/Macro):
+     nunca consulta por una noticia aislada.
+   - Ventanas flexibles (`09:15-09:30`, `09:30-09:50` y `15:45-16:00 ET`) vs ventanas estrictas en todo
+     otro horario exigiendo combinaciones multi-pilar de altísima convicción.
+   - Tope por minuto + tope por hora, cooldown extendido y huella estructural.
+3. Contabilidad exacta de Tokens (input/output/thought/cached/total) y Costo estimado USD por consulta
+   y acumulado de sesión para el supervisor.
 """
 
 from __future__ import annotations
@@ -37,16 +34,19 @@ import requests
 from google import genai
 from pydantic import BaseModel, Field
 
+from analisis import EventoAnalisis, GestorAnalisisMercado
 from cartera import CarteraVirtual
 from config import (
     COOLDOWN_CONSULTA_TICKER_SEG,
     COOLDOWN_NEUTRAL_EXTENDIDO_SEG,
     MAX_ASIGNACION_POR_POSICION_PCT,
+    MAX_CONSULTAS_AI_POR_HORA_ESTRICTA,
     MAX_CONSULTAS_AI_POR_MINUTO,
     MAX_TICKERS_LOTE_AI,
     MIN_TICKERS_LOTE_AI,
     MODELOS_IA_DISPONIBLES,
     UMBRAL_CERTEZA_AI_OPERACION,
+    calcular_costo_consulta_usd,
     formatear_fecha_hora_ampm,
     normalizar_esfuerzo_modelo,
     obtener_regimen_horario_mercado,
@@ -55,8 +55,12 @@ from config import (
     resolver_clave_modelo,
 )
 from historial import GestorHistorial
-from indicadores import AnalisisTecnicoTicker, GestorIndicadores
-from infomarket import GestorInfoMarket, NoticiaMercado
+from scanner import AnalisisTecnicoTicker, ScannerMercado, formatear_monto_compacto
+
+# Alias internos de compatibilidad
+NoticiaMercado = EventoAnalisis
+GestorInfoMarket = GestorAnalisisMercado
+GestorIndicadores = ScannerMercado
 
 
 # ==============================================================================
@@ -168,6 +172,11 @@ class EventoImpresionPrincipal:
     accion_ejecutada_cartera: str
     noticias_analizadas: List[NoticiaMercado]
     analisis_tecnico: AnalisisTecnicoTicker
+    tokens_consulta_input: int = 0
+    tokens_consulta_output: int = 0
+    tokens_consulta_thought: int = 0
+    tokens_consulta_total: int = 0
+    costo_consulta_usd: float = 0.0
 
 
 @dataclass
@@ -194,6 +203,18 @@ class EstadisticasSupervisorIA:
     noticias_durante_pausa: int = 0
     eventos_tec_durante_pausa: int = 0
     total_pausas: int = 0
+    tokens_ultima_input: int = 0
+    tokens_ultima_output: int = 0
+    tokens_ultima_thought: int = 0
+    tokens_ultima_cached: int = 0
+    tokens_ultima_total: int = 0
+    tokens_acum_input: int = 0
+    tokens_acum_output: int = 0
+    tokens_acum_thought: int = 0
+    tokens_acum_cached: int = 0
+    tokens_acum_total: int = 0
+    costo_ultima_usd: float = 0.0
+    costo_acumulado_usd: float = 0.0
 
 
 def _formatear_duracion_seg(segundos: float) -> str:
@@ -212,18 +233,19 @@ def _formatear_duracion_seg(segundos: float) -> str:
 # 2. INSTRUCCIÓN DE SISTEMA INSTITUCIONAL Y UTILIDADES DE ESQUEMA/CONEXIÓN
 # ==============================================================================
 
-SYSTEM_INSTRUCTION_FINANCIERO = """Eres un Analista Cuantitativo Institucional y Gestor de Cartera Senior (VAGY-M1).
-Operas mediante MÉTODO DE CONSULTA MÚLTIPLE: recibes en un solo paquete:
-A) Una VENTANA DE CONTEXTO GENERAL DE MERCADO Y SECTORES (tasas de interés Fed, inflación CPI/PCE, conflictos geopolíticos/aranceles y flujos sectoriales: Semiconductores/IA/Memoria RAM, Óptica, Tecnología, Financiero, Salud, Consumo, Energía/Defensa).
-B) Una VENTANA DE CONTEXTO ESPECÍFICA POR CADA EMPRESA del lote (datos financieros, 13 indicadores actuales, evolución reciente y noticias específicas/interrelacionadas).
-C) El estado porcentual actual de la Cartera Virtual.
+SYSTEM_INSTRUCTION_FINANCIERO = """Eres un Analista Cuantitativo Institucional y Gestor de Cartera Swing Senior (VAGY-M1).
+NO realizas day trading impulsivo por ruido aislado; buscas oportunidades de ALTA CONVICCIÓN respaldadas por confluencia multi-pilar.
+Operas mediante MÉTODO DE CONSULTA MÚLTIPLE recibiendo en un solo paquete:
+A) VENTANA GENERAL DE MERCADO (`FED`, `MACROECONOMIA` - avances en otros países, tensión geopolítica, movimientos bélicos, `DIVULGACIONES_CONGRESO` y Sectores).
+B) ESTADO PORCENTUAL ACTUAL DE LA CARTERA VIRTUAL.
+C) VENTANAS ESPECÍFICAS POR EMPRESA del lote: datos financieros, **Reporte de Resultados** conjunto (`fecha próximo reporte`, `ingresos esperados vs reportados`, EPS y sorpresa), **17 indicadores y patrones** (`ORB`, `Bandera`, `Rebote Sobreventa`, `Tendencia Diaria SMA20/50 + Squeeze`, flujo `RVOL`/`CMF`) y eventos de las **6 secciones** (`NOTICIAS`, `FILINGS_8K`, `REPORTES_RESULTADOS`, `DIVULGACIONES_CONGRESO`, `FED`, `MACROECONOMIA`).
 
 REGLAS ESTRICTAS DE DECISIÓN:
-1. Evalúa CADA ticker solicitado devolviendo una entrada en `decisiones` (exactamente 1 por ticker evaluado) y compara fuerza relativa entre pares del mismo sector si están presentes.
-2. Sé selectivo y riguroso para evitar falsos positivos: marca `alto_potencial = true` únicamente cuando exista confluencia real o un catalizador fundamental/sectorial contundente (`certeza_pct >= 65`). Si una empresa del lote está lateral, sin catalizador o ambigua, responde `alto_potencial = false`, `prediccion_movimiento = "NEUTRAL"` y `accion_cartera = "MANTENER"`.
+1. Evalúa CADA ticker solicitado devolviendo una entrada en `decisiones` (1 por ticker evaluado) comparando fuerza relativa entre pares sectoriales.
+2. Enfoque anti-ruido de altísima selectividad: marca `alto_potencial = true` ÚNICAMENTE si existe confluencia sólida técnico+catalizador o ventaja clara (`certeza_pct >= 68`). De lo contrario responde `alto_potencial = false`, `prediccion_movimiento = "NEUTRAL"` y `accion_cartera = "MANTENER"`.
 3. Operación en BASE PORCENTUAL: expresa `porcentaje_capital_asignar` como % del patrimonio total (0% si es NEUTRAL, entre 5% y 25% si hay alto potencial).
 4. Respeta el `modo_operacion` de la cartera:
-   - `"spot"`: solo abre `COMPRAR_LONG` o cierra posiciones `LONG` existentes (`CERRAR_POSICION`). Si una acción muestra caída inminente grave, puedes marcar `prediccion_movimiento = "BAJISTA"` con `alto_potencial = true` para alertar/cerrar largo si existe en cartera, o `MANTENER` si no está en cartera.
+   - `"spot"`: solo abre `COMPRAR_LONG` o cierra posiciones `LONG` existentes (`CERRAR_POSICION`). Si una acción abierta corre riesgo grave, marca `prediccion_movimiento = "BAJISTA"` con `alto_potencial = true` para alertar/cerrar; si no está en cartera déjala `MANTENER`.
    - `"short y long"`: puedes abrir libremente `COMPRAR_LONG` y `VENDER_SHORT`.
 5. ROTACIÓN DE CARTERA: si falta liquidez o hay posiciones abiertas inferiores, puedes indicar `ROTAR_CARTERA` y `liquidaciones_rotacion`. Si la posición a rotar está en pérdidas (`pyg_pct < 0`), exige `certeza_pct >= 85`.
 6. Responde EXCLUSIVAMENTE en JSON válido conforme al esquema solicitado y redacta los textos en español claro."""
@@ -456,7 +478,9 @@ class AnalizadorAI:
         self.modo_operacion = "short y long" if "short" in modo_operacion.lower() else "spot"
 
         self.infomarket = infomarket
+        self.analisis = infomarket
         self.indicadores = indicadores
+        self.scanner = indicadores
         self.cartera = cartera
         self.historial = historial
         self.callback_alto_potencial = callback_alto_potencial
@@ -471,13 +495,15 @@ class AnalizadorAI:
             regimen_horario=str(reg_init["etiqueta"]),
         )
 
-        # Registro de últimas señales por ticker (para confluencia Indicadores + Noticias + Sectorial)
+        # Registro multi-pilar de últimas señales por ticker (6 secciones analisis + 17 ind/patrones scanner)
         self._senales_recientes: Dict[str, Dict[str, Any]] = {}
         # ticker -> (epoch, huella, precio, fue_neutral)
         self._ultimo_analisis_ticker: Dict[str, Tuple[float, str, float, bool]] = {}
         self._ventana_timestamps_minuto: Deque[float] = deque()
+        self._ventana_timestamps_hora: Deque[float] = deque()
         # cola de candidatos listos para lote: tk -> (prioridad, origen, timestamp_ingreso)
         self._cola_candidatos: Dict[str, Tuple[float, str, float]] = {}
+        self._ultimo_uso_tokens_invocacion: Dict[str, Any] = {}
 
         self._detener = threading.Event()
         self._evento_nuevo_candidato = threading.Event()
@@ -946,9 +972,10 @@ class AnalizadorAI:
         analisis_tec: AnalisisTecnicoTicker,
     ) -> str:
         ult_id_not = noticias_tk[0].id_noticia if noticias_tk else "sin_not"
-        cubeta_certeza = int(analisis_tec.certeza_pct // 8)
+        cubeta_certeza = int(analisis_tec.certeza_pct // 10)
         alarmas = ",".join(sorted(analisis_tec.alarmas_compra + analisis_tec.alarmas_venta))
-        semilla = f"{ticker}|{ult_id_not}|{analisis_tec.evaluacion_general}|{cubeta_certeza}|{alarmas}"
+        patrones = ",".join(sorted(getattr(analisis_tec, "patrones_detectados", [])))
+        semilla = f"{ticker}|{ult_id_not}|{analisis_tec.evaluacion_general}|{cubeta_certeza}|{alarmas}|{patrones}"
         return hashlib.md5(semilla.encode("utf-8")).hexdigest()[:12]
 
     def _extraer_rvol_de_analisis(self, analisis: AnalisisTecnicoTicker) -> float:
@@ -968,14 +995,20 @@ class AnalizadorAI:
         regimen: Optional[Dict[str, Any]] = None,
     ) -> Tuple[float, str, bool]:
         """
-        Evalúa combinaciones reales (Indicadores + Noticias + RVOL + Ripple Sectorial + Régimen Horario)
-        para filtrar escenarios planos que producirían respuestas `NEUTRAL`.
-        Devuelve `(score_confluencia, descripcion_motivo, supera_umbral)`.
+        Smart Gatekeeper Anti-Day-Trading:
+        Evalúa combinaciones multi-pilar reales (Técnico/Patrones + Noticias + 8-K/Resultados +
+        Congreso + Sector/Fed/Macro + Régimen Horario).
+        - NUNCA dispara por una noticia aislada (evita ruido de day trading).
+        - Ventanas flexibles (`09:15-09:30`, `09:30-09:50`, `15:45-16:00 ET`): exige mínimo 2 pilares alineados.
+        - Todo otro horario: ESTRICTO — exige combinación multi-pilar (3+ pilares o 2 pilares de máxima
+          certeza con patrón estructural + RVOL >= 1.35 + catalizador 8-K/Resultados/Congreso)
+          que prácticamente asegure ganancia, o alerta defensiva sobre posición ya abierta.
         """
         tk = ticker.strip().upper()
         reg = regimen or obtener_regimen_horario_mercado()
         ahora = time.time()
-        vigencia_seg = 1200.0  # 20 min de memoria de señales para cruce de confluencia
+        vigencia_seg = 2700.0       # 45 min para noticias/técnico/macro
+        vigencia_inst_seg = 7200.0  # 2h para 8-K / Reportes de Resultados / Congreso
 
         with self._lock:
             mem = dict(self._senales_recientes.get(tk, {}))
@@ -983,13 +1016,25 @@ class AnalizadorAI:
         en_cartera = tk in self.cartera.posiciones
         pos_cartera = self.cartera.posiciones.get(tk)
 
-        # Leer señal noticiosa reciente
+        # Pilar 1: Noticias directas (Sección NOTICIAS)
         tiene_not = (ahora - float(mem.get("not_ts", 0.0))) <= vigencia_seg
         not_score = float(mem.get("not_score", 0.0)) if tiene_not else 0.0
         not_sent = str(mem.get("not_sent", "NEUTRAL")) if tiene_not else "NEUTRAL"
         not_plat = str(mem.get("not_plat", "")) if tiene_not else ""
 
-        # Leer señal técnica reciente (o último snapshot guardado en indicadores)
+        # Pilar 2: Fundamental / Filings 8-K / Reportes de Resultados (Secciones 2 y 3)
+        tiene_fund = (ahora - float(mem.get("rep_ts", 0.0))) <= vigencia_inst_seg
+        rep_score = float(mem.get("rep_score", 0.0)) if tiene_fund else 0.0
+        rep_sent = str(mem.get("rep_sent", "NEUTRAL")) if tiene_fund else "NEUTRAL"
+        rep_sub = str(mem.get("rep_sub", "")) if tiene_fund else ""
+
+        # Pilar 3: Divulgaciones del Congreso (Sección 4)
+        tiene_cong = (ahora - float(mem.get("cong_ts", 0.0))) <= vigencia_inst_seg
+        cong_score = float(mem.get("cong_score", 0.0)) if tiene_cong else 0.0
+        cong_sent = str(mem.get("cong_sent", "NEUTRAL")) if tiene_cong else "NEUTRAL"
+        cong_sub = str(mem.get("cong_sub", "")) if tiene_cong else ""
+
+        # Pilar 4: Cuantitativo Scanner (17 indicadores + patrones ORB/Bandera/Rebote/Squeeze)
         tiene_tec = (ahora - float(mem.get("tec_ts", 0.0))) <= vigencia_seg
         snap_tec: Optional[AnalisisTecnicoTicker] = None
         if not tiene_tec:
@@ -1002,6 +1047,8 @@ class AnalizadorAI:
             tec_rvol = float(mem.get("tec_rvol", 1.0))
             tec_alm = int(mem.get("tec_alm", 0))
             tec_ev = str(mem.get("tec_ev", "NEUTRAL"))
+            tec_patrones = list(mem.get("tec_patrones", []))
+            tec_contra = int(mem.get("tec_contra", 0))
         elif snap_tec is not None:
             tec_dir = snap_tec.direccion_potencial
             tec_pot = snap_tec.potencial_score
@@ -1012,11 +1059,19 @@ class AnalizadorAI:
                 if tec_dir == "ALCISTA"
                 else (len(snap_tec.alarmas_venta) if tec_dir == "BAJISTA" else 0)
             )
+            tec_contra = (
+                len(snap_tec.alarmas_venta)
+                if tec_dir == "ALCISTA"
+                else (len(snap_tec.alarmas_compra) if tec_dir == "BAJISTA" else 0)
+            )
             tec_ev = snap_tec.evaluacion_general
+            tec_patrones = list(getattr(snap_tec, "patrones_detectados", []))
         else:
-            tec_dir, tec_pot, tec_cert, tec_rvol, tec_alm, tec_ev = "NEUTRAL", 0.0, 30.0, 1.0, 0, "NEUTRAL"
+            tec_dir, tec_pot, tec_cert, tec_rvol, tec_alm, tec_ev, tec_patrones, tec_contra = (
+                "NEUTRAL", 0.0, 30.0, 1.0, 0, "NEUTRAL", [], 0
+            )
 
-        # Leer señal sectorial/interrelacionada reciente
+        # Pilar 5: Ripple Sectorial / FED / Macroeconomía (Secciones 5 y 6)
         tiene_rip = (ahora - float(mem.get("rip_ts", 0.0))) <= vigencia_seg
         rip_score = float(mem.get("rip_score", 0.0)) if tiene_rip else 0.0
         rip_sent = str(mem.get("rip_sent", "NEUTRAL")) if tiene_rip else "NEUTRAL"
@@ -1024,91 +1079,145 @@ class AnalizadorAI:
 
         score = 0.0
         razones: List[str] = []
+        pilares: Set[str] = set()
 
-        # 1. Aporte de noticia directa
-        if tiene_not:
-            if not_sent == "NEUTRAL" and not_score < 64.0:
-                score += not_score * 0.28  # Muy bajo por sí sola para evitar neutrales
-            else:
-                score += not_score * 0.65
-                razones.append(f"Noticia {not_sent} ({not_plat}, imp={not_score:.0f})")
+        # Evaluación de Pilar NOTICIAS
+        if tiene_not and not_sent != "NEUTRAL" and not_score >= 58.0:
+            score += not_score * 0.45
+            pilares.add("NOTICIAS")
+            razones.append(f"Noticia {not_sent} ({not_plat}, imp={not_score:.0f})")
 
-        # 2. Aporte cuantitativo con filtro estricto de calidad (alarmas + volumen real RVOL)
+        # Evaluación de Pilar FUNDAMENTAL (8-K / Reportes Resultados + Scanner)
+        if tiene_fund and rep_score >= 64.0 and (rep_sent != "NEUTRAL" or "Inminente" in rep_sub):
+            score += rep_score * 0.55
+            pilares.add("FUNDAMENTAL")
+            razones.append(f"{rep_sub or '8-K/Resultados'} ({rep_sent}, imp={rep_score:.0f})")
+
+        # Evaluación de Pilar CONGRESO
+        if tiene_cong and (cong_sent != "NEUTRAL" or cong_score >= 66.0):
+            score += cong_score * 0.45
+            pilares.add("CONGRESO")
+            razones.append(f"Congreso[{cong_sub}] ({cong_sent})")
+
+        # Evaluación de Pilar TECNICO (Indicadores + Patrones Swing + Volumen Real)
         bajista_no_operable_spot = (
             self.modo_operacion == "spot" and not en_cartera and tec_dir == "BAJISTA"
         )
-        if not bajista_no_operable_spot and tec_dir != "NEUTRAL" and tec_alm >= 2 and tec_cert >= 60.0:
-            aporte_tec = (tec_pot * 0.50) + (tec_cert * 0.25)
+        tiene_patron = len(tec_patrones) >= 1
+        pilar_tec_valido = (
+            not bajista_no_operable_spot
+            and tec_dir != "NEUTRAL"
+            and tec_cert >= 62.0
+            and (tec_alm >= 2 or tiene_patron)
+        )
+        if pilar_tec_valido:
+            pilares.add("TECNICO")
+            aporte_tec = (tec_pot * 0.48) + (tec_cert * 0.24)
             if tec_alm >= 3:
                 aporte_tec += 7.0
+            if tiene_patron:
+                aporte_tec += min(12.0, len(tec_patrones) * 6.0)
             if tec_rvol >= 1.35:
-                aporte_tec += 9.0
-                razones.append(f"{tec_ev} ({tec_alm} alm, RVOL {tec_rvol:.2f}x)")
-            elif tec_rvol >= 1.15:
-                aporte_tec += 3.0
-                razones.append(f"{tec_ev} ({tec_alm} alm)")
-            else:
-                # Volumen apagado en horarios estrictos: reducir peso para no generar neutrales
-                if not reg["es_permisivo"]:
-                    aporte_tec -= 8.0
-                razones.append(f"{tec_ev} (vol bajo)")
+                aporte_tec += 10.0
+            elif tec_rvol < 1.10 and not reg["es_permisivo"]:
+                aporte_tec -= 8.0
             score += aporte_tec
-        elif not bajista_no_operable_spot and tec_dir != "NEUTRAL" and (tiene_not or tiene_rip) and tec_alm >= 1:
-            # Apoyo técnico leve solo si acompaña una noticia o catalizador sectorial
-            score += 12.0
+            pat_str = f" [{tec_patrones[0]}]" if tec_patrones else ""
+            razones.append(f"{tec_ev}{pat_str} (RVOL {tec_rvol:.2f}x)")
 
-        # 3. Bono fuerte por CONFLUENCIA (Noticias + Indicadores alineados)
-        alineado_alcista = (
-            tec_dir == "ALCISTA"
-            and ((tiene_not and not_sent == "POSITIVA") or (tiene_rip and rip_sent == "POSITIVA"))
-        )
-        alineado_bajista = (
-            tec_dir == "BAJISTA"
-            and ((tiene_not and not_sent == "NEGATIVA") or (tiene_rip and rip_sent == "NEGATIVA"))
-        )
-        if alineado_alcista or alineado_bajista:
-            score += 26.0
-            razones.append("Confluencia Noticia+Indicadores")
-
-        # 4. Aporte de noticia sectorial / empresa interrelacionada (ej. chips + memoria RAM, conflicto, tasas)
-        if tiene_rip and rip_score >= 54.0:
-            score += rip_score * 0.28
-            if tec_dir != "NEUTRAL" or abs(tec_pot) >= 45.0 or en_cartera:
-                score += 8.0
+        # Evaluación de Pilar SECTOR_MACRO (Fed / Macroeconomía / Ripple entre pares)
+        if tiene_rip and rip_sent != "NEUTRAL" and rip_score >= 60.0:
+            score += rip_score * 0.35
+            pilares.add("SECTOR_MACRO")
             if rip_orig:
-                razones.append(f"Ripple {rip_orig}")
+                razones.append(f"Macro/Ripple {rip_orig}")
 
-        # 5. Gestión activa de cartera / modo de operación
+        # Bonos de alineación direccional entre pilares
+        votos_alc = (
+            (1 if (pilar_tec_valido and tec_dir == "ALCISTA") else 0)
+            + (1 if (tiene_not and not_sent == "POSITIVA") else 0)
+            + (1 if (tiene_fund and rep_sent == "POSITIVA") else 0)
+            + (1 if (tiene_cong and cong_sent == "POSITIVA") else 0)
+            + (1 if (tiene_rip and rip_sent == "POSITIVA") else 0)
+        )
+        votos_baj = (
+            (1 if (pilar_tec_valido and tec_dir == "BAJISTA") else 0)
+            + (1 if (tiene_not and not_sent == "NEGATIVA") else 0)
+            + (1 if (tiene_fund and rep_sent == "NEGATIVA") else 0)
+            + (1 if (tiene_cong and cong_sent == "NEGATIVA") else 0)
+            + (1 if (tiene_rip and rip_sent == "NEGATIVA") else 0)
+        )
+        alineacion_max = max(votos_alc, votos_baj)
+        contradiccion = (votos_alc >= 1 and votos_baj >= 1) and min(votos_alc, votos_baj) >= 1
+
+        if alineacion_max >= 2 and not contradiccion:
+            score += 22.0 + (alineacion_max - 2) * 14.0
+            razones.append(f"Confluencia {alineacion_max} pilares")
+        elif contradiccion and not en_cartera:
+            score -= 18.0
+
+        # Protección de cartera abierta
+        alerta_defensiva_cartera = False
         if en_cartera and pos_cartera is not None:
             opuesto = (
-                (pos_cartera.tipo == "LONG" and (tec_dir == "BAJISTA" or not_sent == "NEGATIVA"))
-                or (pos_cartera.tipo == "SHORT" and (tec_dir == "ALCISTA" or not_sent == "POSITIVA"))
+                (pos_cartera.tipo == "LONG" and votos_baj >= 2)
+                or (pos_cartera.tipo == "SHORT" and votos_alc >= 2)
             )
+            pnl_pct = 0.0
+            if snap_tec is not None:
+                p_act = snap_tec.datos_financieros.precio_actual
+                if pos_cartera.precio_entrada > 0 and p_act > 0:
+                    if pos_cartera.tipo == "LONG":
+                        pnl_pct = ((p_act - pos_cartera.precio_entrada) / pos_cartera.precio_entrada) * 100.0
+                    else:
+                        pnl_pct = ((pos_cartera.precio_entrada - p_act) / pos_cartera.precio_entrada) * 100.0
             if opuesto:
-                score += 14.0
-                razones.append(f"Alerta Cartera {pos_cartera.tipo}")
-            else:
-                score += 5.0
+                score += 18.0
+                razones.append(f"Protección Cartera {pos_cartera.tipo} ({pnl_pct:+.1f}%)")
+                if abs(pnl_pct) >= 2.5 or alineacion_max >= 2:
+                    alerta_defensiva_cartera = True
         elif self.modo_operacion == "spot":
-            # En SPOT sin posición abierta, señales puramente bajistas no son operables -> suprimir desperdicio
-            sen_bajista_pura = (
-                (tec_dir == "BAJISTA" or not_sent == "NEGATIVA")
-                and tec_dir != "ALCISTA"
-                and not_sent != "POSITIVA"
-            )
-            if sen_bajista_pura:
-                score -= 40.0
+            if votos_baj > 0 and votos_alc == 0:
+                score -= 45.0
 
+        # Regla dura anti-day-trading por horario y pilares:
+        num_pilares = len(pilares)
+        min_pilares = int(reg.get("min_pilares", 2 if reg["es_permisivo"] else 3))
         umbral = float(reg["umbral_confluencia"])
-        desc = " + ".join(razones[:3]) if razones else "Confluencia Multi-Señal"
-        return round(max(0.0, min(200.0, score)), 1), desc, score >= umbral
+
+        if reg["es_permisivo"]:
+            # Ventanas flexibles (09:15-09:30, 09:30-09:50, 15:45-16:00 ET):
+            # Exige mínimo 2 pilares alineados (nunca 1 noticia suelta).
+            combinacion_valida = (alineacion_max >= min_pilares and num_pilares >= min_pilares) or alerta_defensiva_cartera
+        else:
+            # Resto de horarios (estricto):
+            # Exige >= 3 pilares alineados sin contradicción, O combinación de certeza extrema:
+            # Pilar TECNICO fuerte (patrón + RVOL>=1.35 + certeza>=74 + contra<=1) + Pilar FUNDAMENTAL/CONGRESO (imp>=74) alineados.
+            combo_extremo = (
+                pilar_tec_valido
+                and tiene_patron
+                and tec_rvol >= 1.35
+                and tec_cert >= 74.0
+                and tec_contra <= 1
+                and alineacion_max >= 2
+                and not contradiccion
+                and ((tiene_fund and rep_score >= 74.0) or (tiene_cong and cong_score >= 72.0))
+            )
+            combinacion_valida = (
+                (alineacion_max >= min_pilares and num_pilares >= min_pilares and not contradiccion)
+                or combo_extremo
+                or alerta_defensiva_cartera
+            )
+
+        supera = bool(combinacion_valida and score >= umbral)
+        desc = " + ".join(razones[:3]) if razones else f"Pilares insuficientes ({num_pilares}/{min_pilares})"
+        return round(max(0.0, min(200.0, score)), 1), desc, supera
 
     def encolar_por_noticia(self, noticia: NoticiaMercado) -> None:
         """
-        Registra señales de noticia directa y propaga ripples hacia empresas interrelacionadas
-        del mismo sector (ej. Semiconductores + IA + Memoria RAM) para agruparlas en consulta múltiple.
-        Si la IA está pausada (modo offline), registra la noticia en el marco de contexto offline
-        sin enviar consultas; tras `/reanudar`, espera un evento direccional alcista o bajista.
+        Registra eventos de cualquiera de las 6 secciones de `analisis.py` (`NOTICIAS`,
+        `FILINGS_8K`, `REPORTES_RESULTADOS`, `DIVULGACIONES_CONGRESO`, `FED`, `MACROECONOMIA`)
+        en la matriz multi-pilar, propaga ripples sectoriales y filtra ruido de day trading.
         """
         if self.cartera.modo_cierre_activo is not None:
             return
@@ -1124,26 +1233,38 @@ class AnalizadorAI:
 
         reg = obtener_regimen_horario_mercado()
         ahora = time.time()
+        seccion = getattr(noticia, "seccion", "NOTICIAS") or "NOTICIAS"
+        subcat = getattr(noticia, "subcategoria", "") or seccion
         candidatos_potenciales: List[Tuple[str, float, str]] = []
 
-        # Caso A: Noticia específica de un ticker de la lista activa
+        # Caso A: Evento específico de un ticker de la cartera/watchlist
         if noticia.ticker in self.indicadores.tickers:
             tk = noticia.ticker
             with self._lock:
                 mem = self._senales_recientes.setdefault(tk, {})
-                mem["not_ts"] = ahora
-                mem["not_score"] = noticia.impacto_score
-                mem["not_sent"] = noticia.sentimiento
-                mem["not_plat"] = noticia.plataforma
+                if seccion in ("FILINGS_8K", "REPORTES_RESULTADOS"):
+                    mem["rep_ts"] = ahora
+                    mem["rep_score"] = noticia.impacto_score
+                    mem["rep_sent"] = noticia.sentimiento
+                    mem["rep_sub"] = subcat
+                elif seccion == "DIVULGACIONES_CONGRESO":
+                    mem["cong_ts"] = ahora
+                    mem["cong_score"] = noticia.impacto_score
+                    mem["cong_sent"] = noticia.sentimiento
+                    mem["cong_sub"] = subcat
+                else:
+                    mem["not_ts"] = ahora
+                    mem["not_score"] = noticia.impacto_score
+                    mem["not_sent"] = noticia.sentimiento
+                    mem["not_plat"] = noticia.plataforma
 
-            # Si esta noticia sacude todo un clúster sectorial (ej. chips/IA/RAM/Fed), propagar señales a pares afines
             sectores_clave = [s for s in noticia.sectores_relacionados if s not in ("GENERAL", "MACRO_GLOBAL")]
-            if noticia.impacto_score >= 64.0 and noticia.sentimiento != "NEUTRAL" and sectores_clave:
+            if noticia.impacto_score >= 68.0 and noticia.sentimiento != "NEUTRAL" and sectores_clave:
                 pares_rip = self._propagar_ripple_sectorial(
                     sectores=sectores_clave,
                     sentimiento=noticia.sentimiento,
                     impacto=noticia.impacto_score * 0.90,
-                    etiqueta_origen=f"Par[{tk}]/Sector({sectores_clave[0]})",
+                    etiqueta_origen=f"Par[{tk}]/{seccion}",
                     excluir_ticker=tk,
                     reg=reg,
                     solo_registrar_senales=True,
@@ -1157,11 +1278,10 @@ class AnalizadorAI:
                 with self._lock:
                     self._stats.consultas_omitidas_gatekeeper += 1
 
-        # Caso B: Noticia macroeconómica, conflicto geopolítico o noticia de sector (IA/chips/RAM/bancos/salud/consumo)
-        elif noticia.impacto_score >= 58.0:
+        # Caso B: Macroeconomía, FED, Divulgación Congreso sin ticker en lista o 8-K sectorial
+        elif noticia.impacto_score >= 60.0:
             sectores_obj = [s for s in noticia.sectores_relacionados if s not in ("GENERAL", "MACRO_GLOBAL")]
             if not sectores_obj:
-                # Shock macro general (Tasas/Fed/Geopolítica): evaluar posiciones abiertas prioritarias
                 abiertas = list(self.cartera.posiciones.keys())
                 candidatos_macro = abiertas[:4] if abiertas else self.indicadores.tickers[:4]
                 for tk_m in candidatos_macro:
@@ -1170,7 +1290,7 @@ class AnalizadorAI:
                         mem["rip_ts"] = ahora
                         mem["rip_score"] = noticia.impacto_score
                         mem["rip_sent"] = noticia.sentimiento
-                        mem["rip_orig"] = f"{noticia.categoria_mercado}"
+                        mem["rip_orig"] = f"{seccion}/{noticia.categoria_mercado}"
                     sc, mot, ok_m = self.calcular_puntaje_confluencia(tk_m, reg)
                     if ok_m:
                         candidatos_potenciales.append((tk_m, sc, mot))
@@ -1179,7 +1299,7 @@ class AnalizadorAI:
                     sectores=sectores_obj,
                     sentimiento=noticia.sentimiento,
                     impacto=noticia.impacto_score,
-                    etiqueta_origen=f"Sector({noticia.categoria_mercado})",
+                    etiqueta_origen=f"{seccion}({subcat})",
                     excluir_ticker=None,
                     reg=reg,
                     solo_registrar_senales=True,
@@ -1189,7 +1309,6 @@ class AnalizadorAI:
         if pausada or not candidatos_potenciales:
             return
 
-        # Si acabamos de reanudar (/reanudar), exigir evento potencialmente ALCISTA o BAJISTA (no neutral)
         if esperando_post_pausa:
             es_noticia_direccional = noticia.sentimiento in ("POSITIVA", "NEGATIVA")
             if not es_noticia_direccional:
@@ -1201,7 +1320,7 @@ class AnalizadorAI:
                     self._esperando_evento_post_reanudacion = False
                     dir_lbl = "ALCISTA" if noticia.sentimiento == "POSITIVA" else "BAJISTA"
                     self._evento_despertar_post_pausa = (
-                        f"Noticia potencialmente {dir_lbl} [{noticia.ticker}] "
+                        f"Evento {seccion} potencialmente {dir_lbl} [{noticia.ticker}] "
                         f"({noticia.plataforma} | {noticia.sentimiento} | Imp:{noticia.impacto_score:.0f}): "
                         f"{noticia.titulo[:90]}"
                     )
@@ -1227,10 +1346,6 @@ class AnalizadorAI:
         reg: Dict[str, Any],
         solo_registrar_senales: bool = False,
     ) -> List[Tuple[str, float, str]]:
-        """
-        Cuando una noticia afecta a un sector o empresa clave (ej. memoria RAM/chips/IA o bancos),
-        selecciona hasta los 4 pares más reactivos técnicamente para agruparlos en la MISMA consulta múltiple.
-        """
         pares = obtener_tickers_relacionados_por_sectores(sectores, universe=self.indicadores.tickers)
         snapshots = self.indicadores.obtener_snapshots_todos()
         ahora = time.time()
@@ -1266,10 +1381,8 @@ class AnalizadorAI:
 
     def encolar_por_indicadores(self, analisis: AnalisisTecnicoTicker) -> None:
         """
-        Registra ruptura técnica + volumen real RVOL y evalúa la matriz de confluencia
-        contra noticias y régimen horario antes de encolar al lote de IA.
-        En modo pausado (offline) guarda eventos e indicadores en el marco de interrupción;
-        tras `/reanudar` espera un evento ALCISTA o BAJISTA para volver a consultar.
+        Registra ruptura/patrón cuantitativo de `scanner.py` + volumen real RVOL y evalúa
+        confluencia multi-pilar contra `analisis.py` y el régimen horario antes de encolar lote IA.
         """
         if self.cartera.modo_cierre_activo is not None:
             return
@@ -1281,6 +1394,12 @@ class AnalizadorAI:
             if analisis.direccion_potencial == "ALCISTA"
             else (len(analisis.alarmas_venta) if analisis.direccion_potencial == "BAJISTA" else 0)
         )
+        n_contra = (
+            len(analisis.alarmas_venta)
+            if analisis.direccion_potencial == "ALCISTA"
+            else (len(analisis.alarmas_compra) if analisis.direccion_potencial == "BAJISTA" else 0)
+        )
+        patrones = list(getattr(analisis, "patrones_detectados", []))
         ahora = time.time()
 
         with self._lock:
@@ -1292,6 +1411,23 @@ class AnalizadorAI:
             mem["tec_cert"] = analisis.certeza_pct
             mem["tec_rvol"] = rvol
             mem["tec_alm"] = n_alm
+            mem["tec_contra"] = n_contra
+            mem["tec_patrones"] = patrones
+
+            # Si el escáner tiene reporte próximo inminente (<=7d) o recién publicado con sorpresa, reflejarlo en pilar fundamental
+            rep = getattr(analisis.datos_financieros, "reporte_resultados", None)
+            if rep is not None:
+                if (rep.dias_hasta_reporte is not None and 0 <= rep.dias_hasta_reporte <= 7) or (
+                    rep.evaluacion_reporte in ("POSITIVO", "NEGATIVO")
+                ):
+                    mem.setdefault("rep_ts", ahora)
+                    mem.setdefault("rep_score", 70.0 if rep.evaluacion_reporte in ("POSITIVO", "NEGATIVO") else 66.0)
+                    mem.setdefault(
+                        "rep_sent",
+                        "POSITIVA" if rep.evaluacion_reporte == "POSITIVO" else ("NEGATIVA" if rep.evaluacion_reporte == "NEGATIVO" else "NEUTRAL"),
+                    )
+                    mem.setdefault("rep_sub", f"Reporte Scanner ({rep.evaluacion_reporte})")
+
             pausada = self._consultas_pausadas
             esperando_post_pausa = self._esperando_evento_post_reanudacion
 
@@ -1299,8 +1435,7 @@ class AnalizadorAI:
             self._registrar_evento_indicador_offline(analisis, n_alm)
             return
 
-        # Solo evaluar paso al gatekeeper si hubo evento cuantitativo relevante
-        if not analisis.es_evento_alto_potencial and n_alm < 2:
+        if not analisis.es_evento_alto_potencial and n_alm < 2 and not patrones:
             return
 
         reg = obtener_regimen_horario_mercado()
@@ -1365,11 +1500,7 @@ class AnalizadorAI:
         info_offline: Optional[Dict[str, Any]] = None,
         es_reactivacion_post_pausa: bool = False,
     ) -> bool:
-        """
-        Verifica cooldown estándar, cooldown extendido post-NEUTRAL y cambio de huella.
-        Si está volviendo del modo offline con cambios reales o evento nuevo, evita que un
-        enfriamiento previo a la pausa bloquee el análisis de reactivación.
-        """
+        """Verifica cooldown swing ampliado, cooldown extendido post-NEUTRAL y cambio de huella."""
         ahora = time.time()
         huella = self._calcular_huella_contexto(ticker, noticias_tk, analisis_tec)
         precio_act = analisis_tec.datos_financieros.precio_actual
@@ -1385,9 +1516,8 @@ class AnalizadorAI:
                     else 0.0
                 )
 
-                # Noticia explosiva reciente o variación fuerte de precio puede romper el enfriamiento
-                imp_max_not = max((n.impacto_score for n in noticias_tk[:2] if (ahora - n.epoch_publicacion) < 300), default=0.0)
-                es_shock_urgente = (prioridad >= 94.0 and imp_max_not >= 76.0) or cambio_precio_pct >= 1.65
+                imp_max_not = max((n.impacto_score for n in noticias_tk[:2] if (ahora - n.epoch_publicacion) < 600), default=0.0)
+                es_shock_urgente = (prioridad >= 115.0 and imp_max_not >= 80.0) or cambio_precio_pct >= 2.25
 
                 if vuelve_de_offline and info_offline is not None:
                     ini_pausa_ep = float(info_offline.get("inicio_epoch", ahora))
@@ -1395,13 +1525,13 @@ class AnalizadorAI:
                     if ts_prev < ini_pausa_ep and (
                         es_reactivacion_post_pausa
                         or huella != huella_prev
-                        or cambio_precio_pct >= 0.35
+                        or cambio_precio_pct >= 0.45
                         or ticker in actualizados
-                        or imp_max_not >= 65.0
+                        or imp_max_not >= 68.0
                     ):
                         return True
 
-                if huella == huella_prev and cambio_precio_pct < 0.75:
+                if huella == huella_prev and cambio_precio_pct < 1.1:
                     self._stats.consultas_omitidas_gatekeeper += 1
                     return False
 
@@ -1416,19 +1546,28 @@ class AnalizadorAI:
 
             return True
 
-    def _consumir_cupo_rate_limiter_lote(self) -> bool:
-        """Aplica el tope global de llamadas API por minuto a nivel de cada consulta múltiple."""
+    def _consumir_cupo_rate_limiter_lote(self, regimen: Optional[Dict[str, Any]] = None) -> bool:
+        """Aplica tope estricto por minuto y tope por hora según régimen horario."""
         ahora = time.time()
+        reg = regimen or obtener_regimen_horario_mercado()
+        max_hora = int(reg.get("max_consultas_hora", MAX_CONSULTAS_AI_POR_HORA_ESTRICTA))
         with self._lock:
             while self._ventana_timestamps_minuto and (ahora - self._ventana_timestamps_minuto[0]) > 60.0:
                 self._ventana_timestamps_minuto.popleft()
+            while self._ventana_timestamps_hora and (ahora - self._ventana_timestamps_hora[0]) > 3600.0:
+                self._ventana_timestamps_hora.popleft()
+
             if len(self._ventana_timestamps_minuto) >= MAX_CONSULTAS_AI_POR_MINUTO:
                 return False
+            if len(self._ventana_timestamps_hora) >= max_hora:
+                return False
+
             self._ventana_timestamps_minuto.append(ahora)
+            self._ventana_timestamps_hora.append(ahora)
             return True
 
     # ------------------------------------------------------------------
-    # 2. CONSTRUCCIÓN DE PROMPTS (MÉTODO DE CONSULTA MÚLTIPLE + INDIVIDUAL)
+    # 2. CONSTRUCCIÓN DE PROMPTS (6 SECCIONES ANALISIS + 17 INDICADORES SCANNER)
     # ------------------------------------------------------------------
 
     def _formatear_bloque_empresa(
@@ -1444,12 +1583,13 @@ class AnalizadorAI:
 
         if noticias_tk:
             bloque_not_tk = "\n".join(
-                f"    - [{n.fecha_hora_ampm}] ({n.plataforma} | {n.sentimiento} | Imp:{n.impacto_score:.0f}): {n.titulo}"
+                f"    - [{n.fecha_hora_ampm}] [{getattr(n, 'seccion', 'NOTICIAS')}{('|' + n.subcategoria) if getattr(n, 'subcategoria', '') else ''}] "
+                f"({n.plataforma} | {n.sentimiento} | Imp:{n.impacto_score:.0f}): {n.titulo}"
                 + (f" — {n.resumen[:150]}" if n.resumen else "")
-                for n in noticias_tk[:5]
+                for n in noticias_tk[:6]
             )
         else:
-            bloque_not_tk = "    - Sin titulares específicos nuevos para este ticker (revisar contexto sectorial y cuantitativo)."
+            bloque_not_tk = "    - Sin eventos directos nuevos para este ticker (revisar contexto sectorial/macro y scanner)."
 
         bloque_ind = "\n".join(
             f"    - {ind.categoria} | {ind.nombre}: {ind.texto_valor} -> {ind.evaluacion}"
@@ -1475,19 +1615,34 @@ class AnalizadorAI:
             else "N/D"
         )
 
+        rep = getattr(df, "reporte_resultados", None)
+        if rep is not None:
+            rep_txt = (
+                f"Próx:{rep.fecha_proximo_reporte or 'N/D'} ({rep.dias_hasta_reporte if rep.dias_hasta_reporte is not None else '-'}d) | "
+                f"Ing Esp:{formatear_monto_compacto(rep.ingresos_esperados)} vs Rep:{formatear_monto_compacto(rep.ingresos_reportados)} "
+                f"(YoY:{f'{rep.ingresos_crecimiento_yoy_pct:+.1f}%' if rep.ingresos_crecimiento_yoy_pct is not None else 'N/D'}) | "
+                f"EPS Esp:{rep.eps_esperado if rep.eps_esperado is not None else 'N/D'} / Rep:{rep.eps_reportado if rep.eps_reportado is not None else 'N/D'} "
+                f"-> [{rep.evaluacion_reporte}]"
+            )
+        else:
+            rep_txt = "Pendiente de actualización en caché fundamental."
+
+        pats = ", ".join(getattr(analisis_actual, "patrones_detectados", [])) or "Ninguno activo"
+
         return (
-            f"--- EMPRESA [{ticker}] | Sectores: {sectores} | Activación: {origen_disparo} ---\n"
+            f"--- EMPRESA [{ticker}] | Sectores: {sectores} | Activación Gatekeeper: {origen_disparo} ---\n"
             f"  Datos Financieros: Precio=${df.precio_actual:.2f} ({df.cambio_diario_pct:+.2f}%) | "
             f"P/E={pe_s} (Fwd={fpe_s}) | Cap={mcap_s} | Beta={df.beta or 'N/D'} | "
             f"S1/S2=${df.soporte_1:.2f}/${df.soporte_2:.2f} | R1/R2=${df.resistencia_1:.2f}/${df.resistencia_2:.2f} | "
             f"VWAP=${df.vwap_sesion:.2f} | ATR=${df.atr_14:.3f} | 52s={r52} | "
             f"Vol={df.volumen_barra:,.0f}/Prom={df.volumen_promedio_20:,.0f}\n"
-            f"  Consenso Técnico Previo: {analisis_actual.evaluacion_general} "
+            f"  Reporte de Resultados (Scanner): {rep_txt}\n"
+            f"  Consenso Scanner ({len(analisis_actual.indicadores)} Indicadores): {analisis_actual.evaluacion_general} "
             f"(Dir={analisis_actual.direccion_potencial}, Pot={analisis_actual.potencial_score:.1f}/100, "
-            f"Certeza={analisis_actual.certeza_pct:.1f}%)\n"
-            f"  13 Indicadores:\n{bloque_ind}\n"
+            f"Certeza={analisis_actual.certeza_pct:.1f}%) | Patrones Swing: {pats}\n"
+            f"  Indicadores y Patrones:\n{bloque_ind}\n"
             f"  Evolución Reciente Indicadores:\n{bloque_prev}\n"
-            f"  Noticias Específicas / Interrelacionadas [{ticker}] (hasta 48h):\n{bloque_not_tk}"
+            f"  Eventos de 6 Secciones [{ticker}] (Noticias / 8-K / Resultados / Congreso):\n{bloque_not_tk}"
         )
 
     def _obtener_snapshot_offline_para_prompt(self) -> Optional[Dict[str, Any]]:
@@ -1671,15 +1826,18 @@ class AnalizadorAI:
         )
         if noticias_sel:
             for n_off in noticias_sel:
+                sec_lbl = getattr(n_off, "seccion", "NOTICIAS")
+                sub_lbl = getattr(n_off, "subcategoria", "")
+                etq_sec = f"{sec_lbl}/{sub_lbl}" if sub_lbl else sec_lbl
                 lineas.append(
-                    f"    - [{n_off.fecha_hora_ampm}] [{n_off.ticker}|{n_off.categoria_mercado}] "
+                    f"    - [{n_off.fecha_hora_ampm}] [{n_off.ticker}|{etq_sec}] "
                     f"({n_off.plataforma} | {n_off.sentimiento} | Imp:{n_off.impacto_score:.0f}): {n_off.titulo}"
                 )
         else:
-            lineas.append("    - Sin noticias nuevas adicionales capturadas durante este intervalo offline.")
+            lineas.append("    - Sin eventos nuevos adicionales capturados durante este intervalo offline.")
 
         lineas.append(
-            "  NOTA DE CONTINUIDAD OFFLINE: Evalúa esta transición acumulada (datos, indicadores y noticias "
+            "  NOTA DE CONTINUIDAD OFFLINE: Evalúa esta transición acumulada (datos, indicadores y eventos "
             "de la sección D) junto con el estado actual de C y el evento post-reanudación antes de decidir."
         )
         return "\n".join(lineas)
@@ -1693,22 +1851,23 @@ class AnalizadorAI:
     ) -> str:
         """
         Construye el prompt de Consulta Múltiple con:
-        1) Ventana unificada de Contexto General de Mercado y Sectores (tasas, conflictos, sectores).
+        1) Ventana unificada de Contexto General (FED, MACROECONOMIA, DIVULGACIONES_CONGRESO, Sectores).
         2) Estado porcentual actual de la Cartera Virtual.
-        3) Ventana de contexto específica (indicadores + noticias + fundamentales) por CADA empresa del lote.
-        4) Marco de Contexto Offline acumulado durante interrupción si está volviendo de modo offline.
+        3) Ventana específica (17 indicadores + patrones + Reporte Resultados + eventos) por empresa.
+        4) Marco de Contexto Offline si aplica.
         """
         tickers_str = ", ".join(item[0] for item in lote_datos)
         cartera_ctx = self.cartera.obtener_resumen_contexto_ia()
 
         if noticias_generales:
             bloque_general = "\n".join(
-                f"  - [{m.fecha_hora_ampm}] [{m.categoria_mercado}] ({m.plataforma} | {m.sentimiento} | "
-                f"Sectores:{','.join(m.sectores_relacionados[:3])}): {m.titulo}"
-                for m in noticias_generales[:10]
+                f"  - [{m.fecha_hora_ampm}] [{getattr(m, 'seccion', m.categoria_mercado)}"
+                f"{('|' + m.subcategoria) if getattr(m, 'subcategoria', '') else ''}] "
+                f"({m.plataforma} | {m.sentimiento} | Sectores:{','.join(m.sectores_relacionados[:3])}): {m.titulo}"
+                for m in noticias_generales[:12]
             )
         else:
-            bloque_general = "  - Sin alertas macroeconómicas o sectoriales extraordinarias en este corte."
+            bloque_general = "  - Sin alertas macroeconómicas, Fed, Congreso o sectoriales extraordinarias en este corte."
 
         bloques_empresas = "\n\n".join(
             self._formatear_bloque_empresa(tk, orig, n_tk, snap_act, snaps_prev)
@@ -1723,17 +1882,17 @@ class AnalizadorAI:
         )
 
         return (
-            f"=== CONSULTA MÚLTIPLE DE MERCADO VAGY-M1 ({len(lote_datos)} EMPRESAS EN LOTE) ===\n"
+            f"=== CONSULTA MÚLTIPLE SWING DE ALTA CONVICCIÓN VAGY-M1 ({len(lote_datos)} EMPRESAS EN LOTE) ===\n"
             f"Fecha/Hora Local: {formatear_fecha_hora_ampm()} | Régimen Horario Wall Street: {regimen_horario['etiqueta']} ({regimen_horario['hora_et']})\n"
             f"Tickers en esta Consulta Múltiple: [{tickers_str}]\n\n"
-            f"A) VENTANA DE CONTEXTO GENERAL DEL MERCADO Y SECTORES (TASAS FED, INFLACIÓN, CONFLICTOS GEOPOLÍTICOS, SECTORES):\n"
+            f"A) VENTANA DE CONTEXTO GENERAL (FED/TASAS, MACROECONOMÍA/GEOPOLÍTICA/BÉLICO, CONGRESO, SECTORES):\n"
             f"{bloque_general}\n\n"
             f"B) ESTADO ACTUAL DE LA CARTERA VIRTUAL (BASE PORCENTUAL):\n"
             f"  {json.dumps(cartera_ctx, ensure_ascii=False)}\n\n"
-            f"C) VENTANAS DE CONTEXTO ESPECÍFICAS POR EMPRESA EVALUADA:\n"
+            f"C) VENTANAS DE CONTEXTO ESPECÍFICAS POR EMPRESA (SCANNER 17 IND + REPORTES + 6 SECCIONES ANALISIS):\n"
             f"{bloques_empresas}{bloque_offline}\n\n"
-            f"Analiza cada empresa en `decisiones` considerando su contexto específico Y la coyuntura macro/sectorial compartida. "
-            f"Marca `alto_potencial=true` SOLO en oportunidades claras (`certeza_pct >= 65`); las demás déjalas `NEUTRAL`."
+            f"Analiza cada empresa en `decisiones` evaluando confluencia multi-pilar (sin day trading por ruido). "
+            f"Marca `alto_potencial=true` SOLO en oportunidades claras (`certeza_pct >= {int(UMBRAL_CERTEZA_AI_OPERACION)}`); las demás déjalas `NEUTRAL`."
         )
 
     def _construir_prompt_completo(
@@ -1754,7 +1913,7 @@ class AnalizadorAI:
         )
 
     # ------------------------------------------------------------------
-    # 3. INVOCACIÓN A PROVEEDORES IA CON NIVEL DE ESFUERZO + JSON ESTRUCTURADO
+    # 3. INVOCACIÓN A PROVEEDORES IA, TOKENS Y COSTO USD
     # ------------------------------------------------------------------
 
     @staticmethod
@@ -1773,11 +1932,87 @@ class AnalizadorAI:
             return limpio[inicio : fin + 1]
         return limpio
 
+    def _construir_uso_tokens(
+        self,
+        tokens_input: int,
+        tokens_output: int,
+        tokens_thought: int = 0,
+        tokens_cached: int = 0,
+        tokens_total: int = 0,
+    ) -> Dict[str, Any]:
+        in_t = max(0, int(tokens_input or 0))
+        out_t = max(0, int(tokens_output or 0))
+        th_t = max(0, int(tokens_thought or 0))
+        ca_t = max(0, int(tokens_cached or 0))
+        tot_t = max(in_t + out_t, int(tokens_total or 0))
+        costo = calcular_costo_consulta_usd(
+            self.modelo_clave,
+            input_tokens=in_t,
+            output_tokens=out_t,
+            cached_tokens=ca_t,
+            thought_tokens=th_t,
+            total_tokens_reportados=tot_t,
+        ) or 0.0
+        uso = {
+            "input": in_t,
+            "output": out_t,
+            "thought": th_t,
+            "cached": ca_t,
+            "total": tot_t,
+            "costo_usd": costo,
+        }
+        with self._lock:
+            self._ultimo_uso_tokens_invocacion = uso
+        return uso
+
+    def _extraer_uso_gemini_interaccion(self, interaccion: Any) -> Dict[str, Any]:
+        usage = getattr(interaccion, "usage", None)
+        if usage is None:
+            return self._construir_uso_tokens(0, 0, 0, 0, 0)
+        return self._construir_uso_tokens(
+            tokens_input=int(getattr(usage, "total_input_tokens", 0) or 0),
+            tokens_output=int(getattr(usage, "total_output_tokens", 0) or 0),
+            tokens_thought=int(getattr(usage, "total_thought_tokens", 0) or 0),
+            tokens_cached=int(getattr(usage, "total_cached_tokens", 0) or 0),
+            tokens_total=int(getattr(usage, "total_tokens", 0) or 0),
+        )
+
+    def _extraer_uso_vertex(self, resp_vx: Any) -> Dict[str, Any]:
+        meta = getattr(resp_vx, "usage_metadata", None)
+        if meta is None:
+            return self._construir_uso_tokens(0, 0, 0, 0, 0)
+        return self._construir_uso_tokens(
+            tokens_input=int(getattr(meta, "prompt_token_count", 0) or 0),
+            tokens_output=int(getattr(meta, "candidates_token_count", 0) or 0),
+            tokens_thought=int(getattr(meta, "thoughts_token_count", 0) or 0),
+            tokens_cached=int(getattr(meta, "cached_content_token_count", 0) or 0),
+            tokens_total=int(getattr(meta, "total_token_count", 0) or 0),
+        )
+
+    def _extraer_uso_anthropic(self, data: Dict[str, Any]) -> Dict[str, Any]:
+        usage = data.get("usage") if isinstance(data, dict) else {}
+        if not isinstance(usage, dict):
+            usage = {}
+        in_t = int(usage.get("input_tokens") or 0)
+        cache_r = int(usage.get("cache_read_input_tokens") or 0)
+        cache_w = int(usage.get("cache_creation_input_tokens") or 0)
+        out_t = int(usage.get("output_tokens") or 0)
+        in_total = in_t + cache_r + cache_w
+        return self._construir_uso_tokens(
+            tokens_input=in_total,
+            tokens_output=out_t,
+            tokens_thought=0,
+            tokens_cached=cache_r,
+            tokens_total=in_total + out_t,
+        )
+
     def _invocar_json_modelo(self, prompt: str, esquema_cls: type[BaseModel], esquema_plano: Dict[str, Any]) -> Any:
-        """Invoca el modelo configurado pasando `thinking_level` (Gemini) o `output_config.effort` (Anthropic)."""
+        """Invoca el modelo configurado pasando `thinking_level` (Gemini) o `output_config.effort` (Anthropic) y registra uso de tokens."""
         if not self.api_key:
             raise PermissionError("API Key vacía o no proporcionada (401 insufficient credentials).")
 
+        with self._lock:
+            self._ultimo_uso_tokens_invocacion = {}
         modelos_intento = [self.model_id] + [m for m in self.fallback_ids if m != self.model_id]
 
         if self.proveedor == "gemini":
@@ -1803,6 +2038,7 @@ class AnalizadorAI:
                         texto_vx = resp_vx.text or ""
                         if not texto_vx.strip():
                             raise ConnectionError("Vertex AI Express devolvió respuesta vacía.")
+                        self._extraer_uso_vertex(resp_vx)
                         return esquema_cls.model_validate_json(self._extraer_json_limpio(texto_vx))
 
                     # SDK moderno google-genai Interactions API (sin temperature/top_p/top_k/thinking_budget)
@@ -1818,9 +2054,14 @@ class AnalizadorAI:
                             "schema": esquema_plano,
                         },
                     )
-                    texto_salida = interaccion.output_text or ""
+                    texto_salida = getattr(interaccion, "output_text", None) or ""
+                    if not texto_salida.strip():
+                        for out_it in getattr(interaccion, "outputs", None) or []:
+                            if getattr(out_it, "type", "") == "text" and getattr(out_it, "text", None):
+                                texto_salida += str(out_it.text)
                     if not texto_salida.strip():
                         raise ConnectionError("El modelo Gemini devolvió respuesta vacía.")
+                    self._extraer_uso_gemini_interaccion(interaccion)
                     return esquema_cls.model_validate_json(self._extraer_json_limpio(texto_salida))
                 except Exception as exc_g:
                     ultima_exc = exc_g
@@ -1870,6 +2111,7 @@ class AnalizadorAI:
                     raise RuntimeError(f"HTTP {resp.status_code}: {resp.text[:200]}")
 
                 data = resp.json()
+                self._extraer_uso_anthropic(data)
                 bloques = data.get("content", [])
                 texto = "".join(b.get("text", "") for b in bloques if isinstance(b, dict))
                 return esquema_cls.model_validate_json(self._extraer_json_limpio(texto))
@@ -2009,7 +2251,7 @@ class AnalizadorAI:
             if self._consultas_pausadas:
                 return None
 
-        if not self._consumir_cupo_rate_limiter_lote():
+        if not self._consumir_cupo_rate_limiter_lote(regimen):
             with self._lock:
                 self._stats.consultas_omitidas_gatekeeper += len(tickers_ordenados)
                 if vuelve_de_offline and self._offline_info is not None and not self._consultas_pausadas:
@@ -2018,9 +2260,9 @@ class AnalizadorAI:
                     self._stats.estado_agente = "ESPERANDO EVENTO ALZA/BAJA"
             return None
 
-        # Paso 2: obtener ventana específica de cada empresa + ventana unificada de mercado y sectores
+        # Paso 2: obtener ventana específica de cada empresa + ventana unificada de las 6 secciones
         mapa_especificas, noticias_generales = self.infomarket.obtener_contexto_lote(
-            tickers_ordenados, max_por_ticker=5, max_mercado_general=10
+            tickers_ordenados, max_por_ticker=6, max_mercado_general=12
         )
 
         lote_datos: List[Tuple[str, str, List[NoticiaMercado], AnalisisTecnicoTicker, List[AnalisisTecnicoTicker]]] = []
@@ -2038,6 +2280,7 @@ class AnalizadorAI:
         with self._lock:
             if self._consultas_pausadas:
                 return None
+            self._ultimo_uso_tokens_invocacion = {}
             self._stats.regimen_horario = str(regimen["etiqueta"])
             self._stats.ultimos_tickers_consulta = list(tickers_ordenados)
             self._stats.estado_agente = f"CONSULTANDO {len(tickers_ordenados)} EMP."
@@ -2068,7 +2311,16 @@ class AnalizadorAI:
                 self._stats.detalle_alerta = detalle
             return None
 
-        # Paso 4: registrar telemetría agregada del lote, actualizar cooldowns y consumir contexto offline
+        # Paso 4: registrar telemetría de tokens/costo + lote, cooldowns y contexto offline
+        with self._lock:
+            uso_cons = dict(self._ultimo_uso_tokens_invocacion or {})
+        tok_in = int(uso_cons.get("input", 0) or 0)
+        tok_out = int(uso_cons.get("output", 0) or 0)
+        tok_th = int(uso_cons.get("thought", 0) or 0)
+        tok_ca = int(uso_cons.get("cached", 0) or 0)
+        tok_tot = int(uso_cons.get("total", 0) or 0)
+        costo_usd = float(uso_cons.get("costo_usd", 0.0) or 0.0)
+
         self.cartera.panorama_ia_global = resp_lote.panorama_mercado_global
         dec_por_tk: Dict[str, DecisionTickerLote] = {
             d.ticker.strip().upper(): d for d in resp_lote.decisiones
@@ -2082,10 +2334,24 @@ class AnalizadorAI:
             self._stats.total_activos_evaluados += len(tickers_ordenados)
             if len(tickers_ordenados) > 1:
                 self._stats.consultas_ahorradas_lote += len(tickers_ordenados) - 1
+
+            self._stats.tokens_ultima_input = tok_in
+            self._stats.tokens_ultima_output = tok_out
+            self._stats.tokens_ultima_thought = tok_th
+            self._stats.tokens_ultima_cached = tok_ca
+            self._stats.tokens_ultima_total = tok_tot
+            self._stats.costo_ultima_usd = round(costo_usd, 6)
+
+            self._stats.tokens_acum_input += tok_in
+            self._stats.tokens_acum_output += tok_out
+            self._stats.tokens_acum_thought += tok_th
+            self._stats.tokens_acum_cached += tok_ca
+            self._stats.tokens_acum_total += tok_tot
+            self._stats.costo_acumulado_usd = round(self._stats.costo_acumulado_usd + costo_usd, 6)
+
             self._stats.estado_agente = "PAUSADA (OFFLINE)" if self._consultas_pausadas else "ACTIVO"
             self._stats.detalle_alerta = ""
 
-            # Si esta consulta entregó el contexto de interrupción offline, marcarlo como consumido
             if info_offline_snap is not None:
                 self._offline_info = None
                 self._evento_despertar_post_pausa = None
@@ -2161,6 +2427,12 @@ class AnalizadorAI:
                 "accion_cartera": dec.accion_cartera,
                 "ejecucion": resumen_operacion,
                 "post_offline": bool(info_offline_snap is not None),
+                "tokens_input": tok_in,
+                "tokens_output": tok_out,
+                "tokens_thought": tok_th,
+                "tokens_cached": tok_ca,
+                "tokens_total": tok_tot,
+                "costo_usd": costo_usd,
             })
 
             # REGLA DE VISUALIZACIÓN: Solo imprimir bloque en la terminal principal si tiene ALTO POTENCIAL
@@ -2184,6 +2456,11 @@ class AnalizadorAI:
                         accion_ejecutada_cartera=resumen_operacion,
                         noticias_analizadas=noticias_comb,
                         analisis_tecnico=snap_act,
+                        tokens_consulta_input=tok_in,
+                        tokens_consulta_output=tok_out,
+                        tokens_consulta_thought=tok_th,
+                        tokens_consulta_total=tok_tot,
+                        costo_consulta_usd=costo_usd,
                     )
                 )
 
@@ -2282,7 +2559,6 @@ class AnalizadorAI:
             elegidos: List[Tuple[str, str, float]] = [(lider_tk, lider_orig, lider_prio)]
             self._cola_candidatos.pop(lider_tk, None)
 
-            # 1) Preferir acciones que comparten sector/cadena de suministro con el líder
             afines: List[Tuple[str, str, float]] = []
             otros: List[Tuple[str, str, float]] = []
             for tk, (prio, orig, _) in ordenados[1:]:
@@ -2301,14 +2577,13 @@ class AnalizadorAI:
 
     def _bucle_cola(self) -> None:
         while not self._detener.is_set():
-            self._evento_nuevo_candidato.wait(timeout=3.5)
+            self._evento_nuevo_candidato.wait(timeout=4.0)
             self._evento_nuevo_candidato.clear()
             if self._detener.is_set():
                 break
 
-            # Acumular brevemente candidatos cercanos para formar un lote múltiple (método consulta múltiple)
             reg = obtener_regimen_horario_mercado()
-            ventana_lote = float(reg.get("ventana_lote_seg", 3.5))
+            ventana_lote = float(reg.get("ventana_lote_seg", 18.0))
             t_inicio_espera = time.time()
 
             while not self._detener.is_set():
@@ -2325,15 +2600,14 @@ class AnalizadorAI:
                     break
 
                 transcurrido_cola = time.time() - ts_mas_viejo
-                # Despachar inmediatamente si llenamos el lote (6), si ya hay >= MIN_TICKERS y pasó media ventana, o si expiró la ventana
                 listo_lote = (
                     n_cola >= MAX_TICKERS_LOTE_AI
-                    or (n_cola >= MIN_TICKERS_LOTE_AI and (max_prio >= 92.0 or transcurrido_cola >= ventana_lote * 0.65))
+                    or (n_cola >= MIN_TICKERS_LOTE_AI and (max_prio >= 112.0 or transcurrido_cola >= ventana_lote * 0.65))
                     or (time.time() - t_inicio_espera >= ventana_lote)
                 )
 
                 if not listo_lote:
-                    time.sleep(0.35)
+                    time.sleep(0.45)
                     continue
 
                 lote = self._extraer_lote_sector_afines()
@@ -2344,10 +2618,10 @@ class AnalizadorAI:
                 except Exception:
                     pass
                 t_inicio_espera = time.time()
-                time.sleep(1.0)
+                time.sleep(1.5)
 
     def obtener_estadisticas_supervisor(self) -> Dict[str, Any]:
-        """Devuelve telemetría en vivo para la línea `Supervisión AI` en `main.py`."""
+        """Devuelve telemetría en vivo (incluyendo tokens y costo USD) para `Supervisión AI`."""
         with self._lock:
             reg = obtener_regimen_horario_mercado()
             self._stats.regimen_horario = str(reg["etiqueta"])
@@ -2389,4 +2663,16 @@ class AnalizadorAI:
                 "noticias_durante_pausa": self._stats.noticias_durante_pausa,
                 "eventos_tec_durante_pausa": self._stats.eventos_tec_durante_pausa,
                 "total_pausas": self._stats.total_pausas,
+                "tokens_ultima_input": self._stats.tokens_ultima_input,
+                "tokens_ultima_output": self._stats.tokens_ultima_output,
+                "tokens_ultima_thought": self._stats.tokens_ultima_thought,
+                "tokens_ultima_cached": self._stats.tokens_ultima_cached,
+                "tokens_ultima_total": self._stats.tokens_ultima_total,
+                "tokens_acum_input": self._stats.tokens_acum_input,
+                "tokens_acum_output": self._stats.tokens_acum_output,
+                "tokens_acum_thought": self._stats.tokens_acum_thought,
+                "tokens_acum_cached": self._stats.tokens_acum_cached,
+                "tokens_acum_total": self._stats.tokens_acum_total,
+                "costo_ultima_usd": self._stats.costo_ultima_usd,
+                "costo_acumulado_usd": self._stats.costo_acumulado_usd,
             }
